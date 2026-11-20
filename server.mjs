@@ -188,6 +188,8 @@ export async function handler(req, res) {
   const key = `${req.method} ${url.pathname}`;
   const route = routes[key];
   if (!route) return send(404, { error: 'No encontrado' });
+  // en internet nunca sin contraseña: si falta APP_PASSWORD en Vercel, la API no responde
+  if (process.env.VERCEL && !PASSWORD) return send(503, { error: 'Falta configurar APP_PASSWORD en Vercel' });
   if (!PUBLICAS.includes(key) && !autenticado(req)) return send(401, { error: 'Iniciá sesión' });
   try {
     await listo;
