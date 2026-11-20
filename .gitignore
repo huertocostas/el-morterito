@@ -1,0 +1,8 @@
+# Datos reales del negocio: nunca se suben
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+# Excel del cliente
+*.xls
+*.xlsx
