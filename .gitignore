@@ -6,3 +6,6 @@
 # Excel del cliente
 *.xls
 *.xlsx
+node_modules/
+.vercel/
+.env*

@@ -1,13 +1,6 @@
 # El Morterito
 
-Gestión de stock y ventas (minoristas y mayoristas) para El Morterito. Corre en una sola PC, sin internet ni servidor externo.
-
-## Instalación
-
-1. Instalar [Node.js](https://nodejs.org) versión 22.5 o más nueva (trae SQLite incorporado, no hace falta nada más).
-2. Copiar esta carpeta a la PC.
-3. Doble clic en `iniciar.bat`. Se abre el navegador en http://localhost:3000.
-   La ventana negra tiene que quedar abierta mientras se usa la app.
+App web de stock y ventas (minoristas y mayoristas) para El Morterito. Corre en Vercel con la base de datos en Turso, y se entra desde el navegador con una contraseña compartida.
 
 ## Uso
 
@@ -16,14 +9,22 @@ Gestión de stock y ventas (minoristas y mayoristas) para El Morterito. Corre en
 - **Movimientos:** historial por fechas; un movimiento mal cargado se borra y el stock se recalcula solo.
 - **Informes:** ventas del mes, compras, faltantes y lo más vendido. Se puede imprimir.
 
-## Respaldo
+## Deploy en Vercel
 
-Todos los datos están en `morterito.db` (se crea solo la primera vez). Para hacer un respaldo, copiar ese archivo a un pendrive o a la nube. Ese archivo no se sube a GitHub.
+Variables de entorno del proyecto en Vercel:
+
+| Variable | Qué es |
+|---|---|
+| `TURSO_DATABASE_URL` | URL de la base en Turso (`libsql://...`) |
+| `TURSO_AUTH_TOKEN` | Token de acceso de esa base |
+| `APP_PASSWORD` | Contraseña para entrar a la app |
+
+Las tablas se crean solas en el primer uso. Cambiar `APP_PASSWORD` cierra todas las sesiones abiertas.
 
 ## Desarrollo
 
 ```
-node test.mjs
+npm install
+npm test           # pruebas con una base temporal
+npm start          # http://localhost:3000 con base local morterito.db (sin contraseña)
 ```
-
-Corre las pruebas con una base temporal, sin tocar `morterito.db`.

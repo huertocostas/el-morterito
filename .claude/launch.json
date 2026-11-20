@@ -5,7 +5,7 @@
       "name": "morterito-demo",
       "runtimeExecutable": "C:\\Program Files\\nodejs\\node.exe",
       "runtimeArgs": ["server.mjs"],
-      "env": { "MORTERITO_DB": "demo.db", "PORT": "3001" },
+      "env": { "MORTERITO_DB": "demo.db", "PORT": "3001", "APP_PASSWORD": "demo" },
       "port": 3001
     }
   ]

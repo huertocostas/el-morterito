@@ -1,0 +1,17 @@
+{
+  "name": "el-morterito",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gestión de stock y ventas para El Morterito",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0"
+  }
+}

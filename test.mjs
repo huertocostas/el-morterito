@@ -6,14 +6,26 @@ import { rmSync } from 'node:fs';
 import assert from 'node:assert/strict';
 
 const DB = join(tmpdir(), `morterito-test-${Date.now()}.db`), PORT = 3999;
-const srv = spawn(process.execPath, [join(import.meta.dirname, 'server.mjs')], { env: { ...process.env, MORTERITO_DB: DB, PORT } });
+const srv = spawn(process.execPath, [join(import.meta.dirname, 'server.mjs')],
+  { env: { ...process.env, MORTERITO_DB: DB, PORT, APP_PASSWORD: 'clave-test', TURSO_DATABASE_URL: '' } });
+srv.stderr.pipe(process.stderr);
 await new Promise(r => srv.stdout.once('data', r));
+let cookie = '';
 const api = async (method, path, body) => {
-  const r = await fetch(`http://127.0.0.1:${PORT}${path}`, { method, body: body && JSON.stringify(body) });
+  const r = await fetch(`http://127.0.0.1:${PORT}${path}`, { method, body: body && JSON.stringify(body), headers: { cookie } });
+  cookie = r.headers.get('set-cookie')?.split(';')[0] ?? cookie;
   return { status: r.status, data: await r.json() };
 };
 
 try {
+  // login: sin sesión no se ve nada
+  assert.equal((await api('GET', '/api/productos')).status, 401);
+  assert.deepEqual((await api('GET', '/api/sesion')).data, { login: true, ok: false });
+  assert.equal((await api('POST', '/api/login', { password: 'otra' })).status, 400);
+  assert.equal((await api('GET', '/api/productos')).status, 401);
+  assert.equal((await api('POST', '/api/login', { password: 'clave-test' })).status, 200);
+  assert.equal((await api('GET', '/api/productos')).status, 200);
+
   const { data: { id: yerba } } = await api('POST', '/api/productos', { nombre: 'Yerba orgánica', precio_minorista: 100, precio_mayorista: 80, stock_minimo: 5 });
   const { data: { id: miel } } = await api('POST', '/api/productos', { nombre: 'Miel', unidad: 'kg', precio_minorista: 50, stock_minimo: 1 });
   assert.equal((await api('POST', '/api/productos', { nombre: 'yerba ORGÁNICA' })).status, 400, 'nombre duplicado');
@@ -44,6 +56,9 @@ try {
   assert.equal(movs.length, 6);
   await api('DELETE', '/api/movimientos?id=' + movs.find(m => m.tipo === 'ajuste').id);
   assert.equal((await api('GET', '/api/productos')).data.find(p => p.id === yerba).stock, 7);
+
+  await api('POST', '/api/logout');
+  assert.equal((await api('GET', '/api/productos')).status, 401);
   console.log('OK — todas las pruebas pasaron');
 } finally {
   srv.kill();

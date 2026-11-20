@@ -1,15 +1,18 @@
-// El Morterito — gestión de stock y ventas. Requiere Node 22.5+ (trae SQLite incorporado).
+// El Morterito — gestión de stock y ventas.
+// Local: `node server.mjs` usa el archivo morterito.db. En Vercel: api/index.mjs usa Turso (TURSO_DATABASE_URL).
 import http from 'node:http';
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { DatabaseSync } from 'node:sqlite';
+import { join, resolve } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createClient } from '@libsql/client';
 
-const DB_PATH = process.env.MORTERITO_DB || join(import.meta.dirname, 'morterito.db');
-const PORT = Number(process.env.PORT) || 3000;
-const db = new DatabaseSync(DB_PATH);
+const db = createClient({
+  url: process.env.TURSO_DATABASE_URL || pathToFileURL(process.env.MORTERITO_DB || join(import.meta.dirname, 'morterito.db')).href,
+  authToken: process.env.TURSO_AUTH_TOKEN,
+});
 
-db.exec(`
-PRAGMA foreign_keys = ON;
+const listo = db.executeMultiple(`
 CREATE TABLE IF NOT EXISTS productos (
   id INTEGER PRIMARY KEY,
   nombre TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -36,6 +39,9 @@ CREATE VIEW IF NOT EXISTS stock AS
   GROUP BY p.id;
 `);
 
+const all = async (sql, args = []) => (await db.execute({ sql, args })).rows.map(r => ({ ...r }));
+const one = async (sql, args) => (await all(sql, args))[0];
+
 class BadRequest extends Error {}
 const check = (ok, msg) => { if (!ok) throw new BadRequest(msg); };
 const num = (v, campo, min = 0) => {
@@ -45,17 +51,37 @@ const num = (v, campo, min = 0) => {
 };
 const VENTAS = ['minorista', 'mayorista'];
 
-function tx(fn) {
-  db.exec('BEGIN');
-  try { const r = fn(); db.exec('COMMIT'); return r; }
-  catch (e) { db.exec('ROLLBACK'); throw e; }
-}
+// ---------- login ----------
+// Sin APP_PASSWORD (uso local en la PC del negocio) no se pide contraseña.
+const PASSWORD = process.env.APP_PASSWORD || '';
+const SESION = PASSWORD && createHmac('sha256', process.env.SESSION_SECRET || PASSWORD).update('morterito-sesion').digest('hex');
+const hash = s => createHash('sha256').update(String(s)).digest();
+const cookieDe = req => /(?:^|;\s*)sesion=([a-f0-9]+)/.exec(req.headers.cookie || '')?.[1];
+const autenticado = req => !PASSWORD || cookieDe(req) === SESION;
 
 const routes = {
-  'GET /api/productos': () =>
-    db.prepare('SELECT * FROM stock ORDER BY activo DESC, nombre').all(),
+  'GET /api/sesion': (_, __, req) => ({ login: !!PASSWORD, ok: autenticado(req) }),
 
-  'POST /api/productos': (b) => {
+  'POST /api/login': async (b, _, req, res) => {
+    if (!PASSWORD) return { ok: true };
+    if (!timingSafeEqual(hash(b.password), hash(PASSWORD))) {
+      await new Promise(r => setTimeout(r, 800)); // frena intentos a ciegas
+      throw new BadRequest('Contraseña incorrecta');
+    }
+    const https = req.headers['x-forwarded-proto'] === 'https';
+    res.setHeader('Set-Cookie', `sesion=${SESION}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}${https ? '; Secure' : ''}`);
+    return { ok: true };
+  },
+
+  'POST /api/logout': (_, __, ___, res) => {
+    res.setHeader('Set-Cookie', 'sesion=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    return { ok: true };
+  },
+
+  'GET /api/productos': () =>
+    all('SELECT * FROM stock ORDER BY activo DESC, nombre'),
+
+  'POST /api/productos': async (b) => {
     const nombre = String(b.nombre ?? '').trim();
     check(nombre, 'Falta el nombre');
     const p = {
@@ -69,97 +95,113 @@ const routes = {
     };
     // COLLATE NOCASE de SQLite no iguala acentos en mayúscula (Á/á), así que se controla acá
     const clave = nombre.toLocaleLowerCase('es');
-    check(!db.prepare('SELECT id, nombre FROM productos').all()
+    check(!(await all('SELECT id, nombre FROM productos'))
       .some(x => x.id !== Number(b.id) && x.nombre.toLocaleLowerCase('es') === clave), 'Ya existe un producto con ese nombre');
     const cols = Object.keys(p);
     if (b.id) {
-      const r = db.prepare(`UPDATE productos SET ${cols.map(c => `${c}=:${c}`).join(',')} WHERE id=:id`)
-        .run({ ...p, id: Number(b.id) });
-      check(r.changes === 1, 'Producto no encontrado');
+      const r = await db.execute({ sql: `UPDATE productos SET ${cols.map(c => `${c}=:${c}`).join(',')} WHERE id=:id`, args: { ...p, id: Number(b.id) } });
+      check(r.rowsAffected === 1, 'Producto no encontrado');
       return { id: Number(b.id) };
     }
-    const r = db.prepare(`INSERT INTO productos (${cols}) VALUES (${cols.map(c => ':' + c)})`).run(p);
+    const r = await db.execute({ sql: `INSERT INTO productos (${cols}) VALUES (${cols.map(c => ':' + c)})`, args: p });
     return { id: Number(r.lastInsertRowid) };
   },
 
   // { tipo, fecha, items: [{ producto_id, cantidad, precio_unitario }] }
-  'POST /api/movimientos': (b) => {
+  'POST /api/movimientos': async (b) => {
     check(['minorista', 'mayorista', 'compra', 'ajuste'].includes(b.tipo), 'Tipo inválido');
     check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
     check(Array.isArray(b.items) && b.items.length, 'No hay productos cargados');
-    const ins = db.prepare('INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario) VALUES (?,?,?,?,?)');
-    const existe = db.prepare('SELECT 1 FROM productos WHERE id = ?');
-    return tx(() => {
-      for (const it of b.items) {
-        check(existe.get(Number(it.producto_id)), 'Producto inexistente');
-        // En ajustes la cantidad viene con signo (+ sobrante, - faltante); en el resto, positiva.
-        const cant = b.tipo === 'ajuste' ? num(it.cantidad, 'Cantidad', -Infinity) : num(it.cantidad, 'Cantidad');
-        check(cant !== 0, 'La cantidad no puede ser 0');
-        ins.run(b.fecha, b.tipo, Number(it.producto_id), VENTAS.includes(b.tipo) ? -cant : cant,
-          num(it.precio_unitario, 'Precio'));
-      }
-      return { ok: true, cargados: b.items.length };
+    const ids = [...new Set(b.items.map(it => Number(it.producto_id)))];
+    check(ids.every(Number.isInteger), 'Producto inexistente');
+    const existen = await all(`SELECT id FROM productos WHERE id IN (${ids.map(() => '?')})`, ids);
+    check(existen.length === ids.length, 'Producto inexistente');
+    // se valida todo antes de escribir; batch = todo o nada
+    const stmts = b.items.map(it => {
+      // En ajustes la cantidad viene con signo (+ sobrante, - faltante); en el resto, positiva.
+      const cant = b.tipo === 'ajuste' ? num(it.cantidad, 'Cantidad', -Infinity) : num(it.cantidad, 'Cantidad');
+      check(cant !== 0, 'La cantidad no puede ser 0');
+      return {
+        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario) VALUES (?,?,?,?,?)',
+        args: [b.fecha, b.tipo, Number(it.producto_id), VENTAS.includes(b.tipo) ? -cant : cant, num(it.precio_unitario, 'Precio')],
+      };
     });
+    await db.batch(stmts, 'write');
+    return { ok: true, cargados: stmts.length };
   },
 
-  'GET /api/movimientos': (_, q) => {
-    const desde = q.get('desde') || '0000-00-00', hasta = q.get('hasta') || '9999-99-99';
-    return db.prepare(`SELECT m.*, p.nombre, p.unidad FROM movimientos m JOIN productos p ON p.id = m.producto_id
-      WHERE m.fecha BETWEEN ? AND ? ORDER BY m.fecha DESC, m.id DESC`).all(desde, hasta);
-  },
+  'GET /api/movimientos': (_, q) =>
+    all(`SELECT m.*, p.nombre, p.unidad FROM movimientos m JOIN productos p ON p.id = m.producto_id
+      WHERE m.fecha BETWEEN ? AND ? ORDER BY m.fecha DESC, m.id DESC`,
+    [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99']),
 
-  'DELETE /api/movimientos': (_, q) => {
-    const r = db.prepare('DELETE FROM movimientos WHERE id = ?').run(Number(q.get('id')));
-    check(r.changes === 1, 'Movimiento no encontrado');
+  'DELETE /api/movimientos': async (_, q) => {
+    const r = await db.execute({ sql: 'DELETE FROM movimientos WHERE id = ?', args: [Number(q.get('id'))] });
+    check(r.rowsAffected === 1, 'Movimiento no encontrado');
     return { ok: true };
   },
 
-  'GET /api/informe': (_, q) => {
+  'GET /api/informe': async (_, q) => {
     const mes = q.get('mes') ?? '';
     check(/^\d{4}-\d{2}$/.test(mes), 'Mes inválido');
-    const like = mes + '-%';
+    const like = [mes + '-%'];
     return {
-      ventas: db.prepare(`SELECT tipo, COUNT(*) AS lineas, SUM(-cantidad * precio_unitario) AS total
-        FROM movimientos WHERE fecha LIKE ? AND tipo IN ('minorista','mayorista') GROUP BY tipo`).all(like),
-      compras: db.prepare(`SELECT COALESCE(SUM(cantidad * precio_unitario), 0) AS total
-        FROM movimientos WHERE fecha LIKE ? AND tipo = 'compra'`).get(like).total,
-      mas_vendidos: db.prepare(`SELECT p.nombre, p.unidad, SUM(-m.cantidad) AS cantidad,
+      ventas: await all(`SELECT tipo, COUNT(*) AS lineas, SUM(-cantidad * precio_unitario) AS total
+        FROM movimientos WHERE fecha LIKE ? AND tipo IN ('minorista','mayorista') GROUP BY tipo`, like),
+      compras: (await one(`SELECT COALESCE(SUM(cantidad * precio_unitario), 0) AS total
+        FROM movimientos WHERE fecha LIKE ? AND tipo = 'compra'`, like)).total,
+      mas_vendidos: await all(`SELECT p.nombre, p.unidad, SUM(-m.cantidad) AS cantidad,
           SUM(-m.cantidad * m.precio_unitario) AS total
         FROM movimientos m JOIN productos p ON p.id = m.producto_id
         WHERE m.fecha LIKE ? AND m.tipo IN ('minorista','mayorista')
-        GROUP BY p.id ORDER BY total DESC`).all(like),
-      faltantes: db.prepare(`SELECT nombre, unidad, stock, stock_minimo FROM stock
-        WHERE activo = 1 AND stock <= stock_minimo ORDER BY stock - stock_minimo`).all(),
+        GROUP BY p.id ORDER BY total DESC`, like),
+      faltantes: await all(`SELECT nombre, unidad, stock, stock_minimo FROM stock
+        WHERE activo = 1 AND stock <= stock_minimo ORDER BY stock - stock_minimo`),
     };
   },
 };
+const PUBLICAS = ['GET /api/sesion', 'POST /api/login'];
 
-const html = readFileSync(join(import.meta.dirname, 'index.html'));
-
-http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x');
-  if (req.method === 'GET' && url.pathname === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    return res.end(html);
+async function leerBody(req) {
+  let raw = req.body; // en Vercel ya viene leído
+  if (raw === undefined) {
+    raw = '';
+    for await (const chunk of req) { raw += chunk; if (raw.length > 1e6) throw new BadRequest('Pedido demasiado grande'); }
   }
-  const route = routes[`${req.method} ${url.pathname}`];
+  if (Buffer.isBuffer(raw)) raw = raw.toString();
+  if (typeof raw !== 'string') return raw ?? {};
+  try { return JSON.parse(raw || '{}'); } catch { throw new BadRequest('JSON inválido'); }
+}
+
+export async function handler(req, res) {
+  const url = new URL(req.url, 'http://x');
   const send = (code, data) => {
-    res.writeHead(code, { 'Content-Type': 'application/json' });
+    res.statusCode = code;
+    res.setHeader('Content-Type', 'application/json');
     res.end(JSON.stringify(data));
   };
+  // en Vercel la página la sirve public/ directamente; esto es para uso local
+  if (req.method === 'GET' && url.pathname === '/') {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.end(readFileSync(join(import.meta.dirname, 'public', 'index.html')));
+  }
+  const key = `${req.method} ${url.pathname}`;
+  const route = routes[key];
   if (!route) return send(404, { error: 'No encontrado' });
+  if (!PUBLICAS.includes(key) && !autenticado(req)) return send(401, { error: 'Iniciá sesión' });
   try {
-    let body = {};
-    if (req.method === 'POST') {
-      let raw = '';
-      for await (const chunk of req) { raw += chunk; if (raw.length > 1e6) throw new BadRequest('Pedido demasiado grande'); }
-      try { body = JSON.parse(raw || '{}'); } catch { throw new BadRequest('JSON inválido'); }
-    }
-    send(200, route(body, url.searchParams));
+    await listo;
+    const body = req.method === 'POST' ? await leerBody(req) : {};
+    send(200, await route(body, url.searchParams, req, res));
   } catch (e) {
     if (e instanceof BadRequest) return send(400, { error: e.message });
     if (String(e.message).includes('UNIQUE')) return send(400, { error: 'Ya existe un producto con ese nombre' });
     console.error(e);
-    send(500, { error: 'Error interno: ' + e.message });
+    send(500, { error: 'Error interno' });
   }
-}).listen(PORT, '127.0.0.1', () => console.log(`El Morterito en http://localhost:${PORT}  (base: ${DB_PATH})`));
+}
+
+if (resolve(process.argv[1] ?? '') === fileURLToPath(import.meta.url)) {
+  const PORT = Number(process.env.PORT) || 3000;
+  http.createServer(handler).listen(PORT, '127.0.0.1', () => console.log(`El Morterito en http://localhost:${PORT}`));
+}
