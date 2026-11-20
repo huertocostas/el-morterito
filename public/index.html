@@ -42,6 +42,7 @@
 
   /* ---- pantalla de venta ---- */
   .pos { display: grid; grid-template-columns: 1fr 390px; gap: 16px; align-items: start; }
+  .pos > * { min-width: 0; } /* sin esto, filas que no se parten (categorías) ensanchan la página */
   .seg { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 3px; margin-bottom: 12px; background: #ebe6da; border-radius: 8px; }
   .seg button { border: 0; background: transparent; padding: 7px 16px; border-radius: 6px; color: var(--muted); }
   .seg button.on { background: var(--card); color: var(--ink); font-weight: 500; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
@@ -88,10 +89,35 @@
   button.big { padding: 13px; font-size: 17px; font-weight: 600; }
   button.primary:disabled { opacity: .5; cursor: default; }
   input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+  .ver-ticket { display: none; }
   @media (max-width: 820px) {
+    header { padding: 8px; gap: 4px 6px; flex-wrap: nowrap; }
+    header h1 { display: none; } /* el espacio es para que entren las 4 secciones */
+    nav { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; gap: 2px; }
+    nav button { padding: 6px 7px; font-size: 14px; white-space: nowrap; }
+    #salir { padding: 5px 8px; font-size: 13px; }
+    main { padding: 12px 12px 150px; }
     .pos { grid-template-columns: 1fr; }
-    .ticket { position: static; max-height: none; }
-    .tiles { max-height: 50vh; }
+    .seg { display: flex; flex-wrap: nowrap; width: 100%; }
+    .seg button { flex: 1; padding: 7px 4px; font-size: 14px; }
+    #ayudaTipo { display: none; }
+    .chips { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; margin-bottom: 10px; }
+    .chips button { white-space: nowrap; }
+    .tiles { grid-template-columns: 1fr 1fr; max-height: none; overflow: visible; }
+    .tile { min-height: 76px; padding: 10px; }
+    .t-nombre { font-size: 14px; }
+    /* ticket = barra fija abajo; se despliega como hoja al tocar "Ver ticket" */
+    .ticket { position: fixed; left: 0; right: 0; bottom: 0; top: auto; z-index: 5; max-height: 80vh;
+      border-radius: 14px 14px 0 0; border-bottom: 0; box-shadow: 0 -4px 16px rgba(0,0,0,.12); }
+    .ticket:not(.abierta) .ticket-head, .ticket:not(.abierta) .lineas, .ticket:not(.abierta) #limpiar { display: none; }
+    .ticket-foot { grid-template-columns: 1fr auto; align-items: center; padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); border-top: 0; }
+    .ticket.abierta .ticket-foot { border-top: 1px solid var(--line); }
+    .ver-ticket { display: block; justify-self: start; padding: 4px 0; border: 0; background: none; color: var(--accent); font-weight: 500; }
+    .total { gap: 6px; }
+    .total b { font-size: 22px; }
+    #msgCargar:empty { display: none; }
+    #guardar, #msgCargar, #limpiar { grid-column: 1 / -1; }
+    .l-bot { flex-wrap: wrap; }
   }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
   .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
@@ -152,6 +178,7 @@
         </div>
         <div class="lineas" id="lineas"></div>
         <div class="ticket-foot">
+          <button class="ver-ticket" id="verTicket" aria-expanded="false"></button>
           <div class="total" id="totalWrap"><span class="muted">Total</span><b id="total"></b></div>
           <button class="primary big" id="guardar"></button>
           <button class="link" id="limpiar" style="justify-self:center;color:var(--muted)">Vaciar</button>
@@ -328,6 +355,14 @@ const esVenta = () => tipo === 'minorista' || tipo === 'mayorista';
 const precioDe = p => tipo === 'minorista' ? p.precio_minorista : tipo === 'mayorista' ? p.precio_mayorista : 0;
 const totalTicket = () => lineas.reduce((s, l) => s + l.cantidad * l.precio, 0);
 const BOTON = { minorista: 'Cobrar', mayorista: 'Cobrar', compra: 'Guardar compra', ajuste: 'Guardar ajuste' };
+// en el celular no se enfoca el buscador: abriría el teclado en cada toque
+const enfocarBusqueda = () => { if (matchMedia('(pointer: fine)').matches) $('#q').focus(); };
+const abrirTicket = abrir => {
+  $('.ticket').classList.toggle('abierta', abrir);
+  $('#verTicket').setAttribute('aria-expanded', abrir);
+  actualizarTotales();
+};
+$('#verTicket').onclick = () => abrirTicket(!$('.ticket').classList.contains('abierta'));
 
 function setTipo(t) {
   tipo = t;
@@ -338,7 +373,7 @@ function setTipo(t) {
   for (const l of lineas) l.precio = precioDe(l.p);
   pintarTiles(); pintarLineas();
 }
-document.querySelectorAll('#tipos button').forEach(b => b.onclick = () => { setTipo(b.dataset.tipo); $('#q').focus(); });
+document.querySelectorAll('#tipos button').forEach(b => b.onclick = () => { setTipo(b.dataset.tipo); enfocarBusqueda(); });
 
 let categoria = ''; // '' = todas
 function filtrados() {
@@ -363,7 +398,7 @@ function agregar(p) {
   const l = lineas.find(l => l.p.id === p.id);
   if (l) l.cantidad += 1; else lineas.push({ p, cantidad: 1, precio: precioDe(p) });
   $('#q').value = ''; flash($('#msgCargar'), '');
-  pintarTiles(); pintarLineas(); $('#q').focus();
+  pintarTiles(); pintarLineas(); enfocarBusqueda();
 }
 $('#tiles').onclick = e => {
   const b = e.target.closest('.tile');
@@ -371,7 +406,7 @@ $('#tiles').onclick = e => {
 };
 $('#cats').onclick = e => {
   const b = e.target.closest('[data-cat]');
-  if (b) { categoria = b.dataset.cat; pintarTiles(); $('#q').focus(); }
+  if (b) { categoria = b.dataset.cat; pintarTiles(); enfocarBusqueda(); }
 };
 $('#q').oninput = pintarTiles;
 $('#q').onkeydown = e => {
@@ -403,6 +438,8 @@ function actualizarTotales() {
   $('#total').textContent = money(totalTicket());
   $('#guardar').textContent = BOTON[tipo] + (esVenta() && lineas.length ? ' ' + money(totalTicket()) : '');
   $('#guardar').disabled = !lineas.length;
+  const abierta = $('.ticket').classList.contains('abierta');
+  $('#verTicket').textContent = abierta ? 'Ocultar ticket ▾' : `Ver ticket (${lineas.length}) ▴`;
 }
 $('#lineas').onclick = e => {
   const d = e.target.dataset;
@@ -420,15 +457,15 @@ $('#lineas').oninput = e => {
   if (d.precio) lineas[d.precio].precio = Number(e.target.value) || 0;
   actualizarTotales();
 };
-$('#limpiar').onclick = () => { lineas = []; pintarLineas(); flash($('#msgCargar'), ''); $('#q').focus(); };
+$('#limpiar').onclick = () => { lineas = []; pintarLineas(); flash($('#msgCargar'), ''); enfocarBusqueda(); };
 $('#guardar').onclick = async () => {
   if (lineas.some(l => !l.cantidad)) return flash($('#msgCargar'), 'Hay un producto con cantidad 0.', true);
   const btn = $('#guardar'), total = totalTicket(); btn.disabled = true;
   try {
     await api('POST', '/api/movimientos', { tipo, fecha: $('#fecha').value, items: lineas.map(l => ({ producto_id: l.p.id, cantidad: l.cantidad, precio_unitario: l.precio })) });
-    lineas = []; pintarLineas(); await cargarProductos();
+    lineas = []; abrirTicket(false); pintarLineas(); await cargarProductos();
     flash($('#msgCargar'), esVenta() ? `Venta guardada: ${money(total)}` : 'Guardado correctamente');
-    $('#msgCargar').classList.add('ok'); $('#q').focus();
+    $('#msgCargar').classList.add('ok'); enfocarBusqueda();
   } catch (err) { flash($('#msgCargar'), err.message, true); btn.disabled = false; }
 };
 
