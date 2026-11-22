@@ -93,8 +93,6 @@
   .seg.pago { display: flex; margin: 0; }
   .seg.pago button { flex: 1; }
   .seg.pago[hidden] { display: none; }
-  .cierre td:not(:first-child), .cierre th:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
-  .cierre tr.neto td { font-weight: 600; font-size: 17px; border-bottom: 0; }
   button.primary:disabled { opacity: .5; cursor: default; }
   input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
   .ver-ticket { display: none; }
@@ -132,6 +130,7 @@
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
   .stat { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
   .stat b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .stat small { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
   .scroll { overflow-x: auto; }
   .login { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; padding: 16px; background: var(--bg); }
   .login[hidden] { display: none; }
@@ -301,26 +300,20 @@
 
   <!-- INFORMES -->
   <section id="informes">
-    <div class="card">
-      <div class="row" style="justify-content:space-between;margin-bottom:8px">
-        <h2 style="margin:0">Cierre de caja</h2>
-        <label class="noprint">Día<input type="date" id="cFecha"></label>
-      </div>
-      <div class="scroll"><table class="cierre">
-        <thead><tr><th></th><th>Efectivo</th><th>Transferencia</th></tr></thead>
-        <tbody id="cTabla"></tbody>
-      </table></div>
-      <p class="muted" id="cNota" style="margin:8px 0 0"></p>
-    </div>
     <div class="row noprint" style="margin-bottom:16px">
-      <label>Mes<input type="month" id="iMes"></label>
-      <button id="iVer">Ver</button>
+      <div class="seg" id="iPeriodo" role="group" aria-label="Período" style="margin:0">
+        <button data-p="dia" class="on">Día</button><button data-p="semana">Semana</button><button data-p="mes">Mes</button>
+      </div>
+      <label>Fecha<input type="date" id="iFecha"></label>
       <button onclick="print()">Imprimir</button>
     </div>
     <h2 id="iTitulo"></h2>
+    <h3>Cierre de caja</h3>
+    <div class="stats" id="iCaja"></div>
+    <h3>Ventas y resultado</h3>
     <div class="stats" id="iStats"></div>
     <p class="muted" id="iAviso"></p>
-    <h3>Gastos del mes por categoría</h3>
+    <h3>Gastos por categoría</h3>
     <div class="card scroll"><table>
       <thead><tr><th>Categoría</th><th class="n">Monto</th></tr></thead>
       <tbody id="iGastos"></tbody>
@@ -330,7 +323,7 @@
       <thead><tr><th>Producto</th><th class="n">Stock actual</th><th class="n">Mínimo</th></tr></thead>
       <tbody id="iFaltan"></tbody>
     </table></div>
-    <h3>Lo más vendido del mes</h3>
+    <h3>Lo más vendido</h3>
     <div class="card scroll"><table>
       <thead><tr><th>#</th><th>Producto</th><th class="n">Cantidad</th><th class="n">Importe</th><th class="n">Ganancia</th></tr></thead>
       <tbody id="iTop"></tbody>
@@ -600,50 +593,57 @@ $('#tablaGastos').onclick = async e => {
   try { await api('DELETE', '/api/gastos?id=' + id); await verGastos(); } catch (err) { alert(err.message); }
 };
 
-// ---------- cierre de caja ----------
-async function verCierre() {
-  const d = await api('GET', '/api/cierre?fecha=' + $('#cFecha').value);
-  const venta = m => d.ventas.find(v => v.medio_pago === m)?.total || 0;
-  const gasto = m => d.gastos.filter(g => g.medio_pago === m).reduce((s, g) => s + g.monto, 0);
-  const fila = (t, f, cls = '') => `<tr class="${cls}"><td>${t}</td>${['efectivo', 'transferencia'].map(m => {
-    const n = f(m); return `<td class="${n < 0 ? 'bad' : ''}">${money(n)}</td>`; }).join('')}</tr>`;
-  $('#cTabla').innerHTML = fila('Ventas', venta) + fila('− Gastos y reposición', m => -gasto(m))
-    + fila('Queda', m => venta(m) - gasto(m), 'neto');
-  const sinDato = venta('');
-  $('#cNota').textContent = [
-    d.gastos.length ? 'Gastos del día: ' + d.gastos.map(g => `${g.concepto || g.categoria} ${money(g.monto)} (${MEDIO[g.medio_pago]})`).join(', ') : 'Sin gastos ese día.',
-    sinDato ? `Hay ${money(sinDato)} en ventas sin medio de pago (cargadas antes de este cambio).` : '',
-  ].join(' ');
-}
-$('#cFecha').onchange = verCierre;
-
 // ---------- informes ----------
+let periodo = 'dia';
+const iso = d => d.toLocaleDateString('en-CA');
+const fechaLarga = (d, opc) => d.toLocaleDateString('es-AR', opc);
+// rango del período que contiene la fecha elegida; la semana va de lunes a domingo
+function rango() {
+  const [y, m, dd] = $('#iFecha').value.split('-').map(Number), d = new Date(y, m - 1, dd);
+  if (periodo === 'dia') return { desde: iso(d), hasta: iso(d), titulo: 'Informe del ' + fechaLarga(d, { weekday: 'long', day: 'numeric', month: 'long' }) };
+  if (periodo === 'mes') return { desde: iso(new Date(y, m - 1, 1)), hasta: iso(new Date(y, m, 0)), titulo: 'Informe de ' + fechaLarga(d, { month: 'long', year: 'numeric' }) };
+  const lunes = new Date(y, m - 1, dd - (d.getDay() + 6) % 7), domingo = new Date(lunes.getFullYear(), lunes.getMonth(), lunes.getDate() + 6);
+  return { desde: iso(lunes), hasta: iso(domingo), titulo: `Semana del ${fechaLarga(lunes, { day: 'numeric', month: 'short' })} al ${fechaLarga(domingo, { day: 'numeric', month: 'short' })}` };
+}
+const stat = (t, n, sub = '') => `<div class="stat"><span class="muted">${t}</span><b class="${n < 0 ? 'bad' : ''}">${money(n)}</b>${sub ? `<small>${sub}</small>` : ''}</div>`;
+document.querySelectorAll('#iPeriodo button').forEach(b => b.onclick = () => {
+  periodo = b.dataset.p;
+  document.querySelectorAll('#iPeriodo button').forEach(x => x.classList.toggle('on', x === b));
+  verInforme();
+});
+$('#iFecha').onchange = verInforme;
+
 async function verInforme() {
-  verCierre();
-  const mes = $('#iMes').value, d = await api('GET', '/api/informe?mes=' + mes);
+  const r = rango(), d = await api('GET', `/api/informe?desde=${r.desde}&hasta=${r.hasta}`);
   const suma = k => d.ventas.reduce((s, x) => s + (x[k] || 0), 0);
   const v = t => d.ventas.find(x => x.tipo === t)?.total || 0;
   const ventas = suma('total'), ganancia = suma('ganancia'), gastos = d.gastos.reduce((s, g) => s + g.total, 0);
-  const nombreMes = new Date(mes + '-02').toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
-  $('#iTitulo').textContent = 'Informe de ' + nombreMes;
+  $('#iTitulo').textContent = r.titulo;
+  // cierre de caja: por medio de pago, lo cobrado menos lo pagado
+  const cobrado = m => d.ventas_medio.find(x => x.medio_pago === m)?.total || 0;
+  const pagado = m => d.gastos_medio.find(x => x.medio_pago === m)?.total || 0;
+  $('#iCaja').innerHTML = stat('Efectivo en caja', cobrado('efectivo') - pagado('efectivo'),
+      `ventas ${money(cobrado('efectivo'))} − gastos ${money(pagado('efectivo'))}`)
+    + stat('Transferencias', cobrado('transferencia') - pagado('transferencia'),
+      `ventas ${money(cobrado('transferencia'))} − gastos ${money(pagado('transferencia'))}`)
+    + (cobrado('') ? stat('Ventas sin medio de pago', cobrado(''), 'cargadas antes de registrar el medio') : '');
   $('#iStats').innerHTML = [['Ventas totales', ventas], ['Minorista', v('minorista')], ['Mayorista', v('mayorista')],
     ['Ganancia de las ventas', ganancia], ['Gastos', gastos], ['Resultado (ventas − gastos)', ventas - gastos]]
-    .map(([t, n]) => `<div class="stat"><span class="muted">${t}</span><b class="${n < 0 ? 'bad' : ''}">${money(n)}</b></div>`).join('');
+    .map(([t, n]) => stat(t, n)).join('');
   const sinCosto = suma('sin_costo');
   $('#iAviso').textContent = sinCosto ? `Ojo: ${sinCosto} venta(s) de productos sin costo cargado cuentan como ganancia completa.` : '';
   $('#iGastos').innerHTML = d.gastos.map(g => `<tr><td>${esc(g.categoria)}</td><td class="n">${money(g.total)}</td></tr>`).join('')
-    || '<tr><td colspan="2" class="muted">Sin gastos en el mes.</td></tr>';
+    || '<tr><td colspan="2" class="muted">Sin gastos en el período.</td></tr>';
   $('#iFaltan').innerHTML = d.faltantes.map(f => `<tr><td>${esc(f.nombre)}</td><td class="n bad">${qty(f.stock)} ${esc(f.unidad)}</td><td class="n">${qty(f.stock_minimo)}</td></tr>`).join('')
     || '<tr><td colspan="3" class="muted">No hay faltantes.</td></tr>';
   $('#iTop').innerHTML = d.mas_vendidos.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.nombre)}</td><td class="n">${qty(r.cantidad)} ${esc(r.unidad)}</td><td class="n">${money(r.total)}</td><td class="n">${money(r.ganancia)}</td></tr>`).join('')
-    || '<tr><td colspan="5" class="muted">Sin ventas en el mes.</td></tr>';
+    || '<tr><td colspan="5" class="muted">Sin ventas en el período.</td></tr>';
 }
-$('#iVer').onclick = verInforme;
 
 // ---------- inicio ----------
 $('#fecha').value = hoy(); $('#mHasta').value = hoy();
-$('#mDesde').value = hoy().slice(0, 8) + '01'; $('#iMes').value = $('#gMes').value = hoy().slice(0, 7);
-$('#formGasto').fecha.value = $('#cFecha').value = hoy();
+$('#mDesde').value = hoy().slice(0, 8) + '01'; $('#gMes').value = hoy().slice(0, 7);
+$('#formGasto').fecha.value = $('#iFecha').value = hoy();
 $('#formLogin').onsubmit = async e => {
   e.preventDefault();
   try { await api('POST', '/api/login', { password: $('#pass').value }); location.reload(); }

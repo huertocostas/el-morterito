@@ -61,7 +61,7 @@ try {
   assert.equal(stock['Yerba orgánica'], 20 - 3 - 10 - 1);
   assert.ok(Math.abs(stock['Miel'] - 0.4) < 1e-9);
 
-  const inf = (await api('GET', '/api/informe?mes=2026-11')).data;
+  const inf = (await api('GET', '/api/informe?desde=2026-11-01&hasta=2026-11-30')).data;
   assert.deepEqual(Object.fromEntries(inf.ventas.map(v => [v.tipo, v.total])), { minorista: 400, mayorista: 800 });
   // yerba cuesta 60: minorista 3x40 + miel sin costo 2x50 = 220; mayorista 10x20 = 200
   assert.deepEqual(Object.fromEntries(inf.ventas.map(v => [v.tipo, v.ganancia])), { minorista: 220, mayorista: 200 });
@@ -70,7 +70,7 @@ try {
 
   // cambiar el costo después no altera la ganancia ya registrada
   assert.equal((await api('POST', '/api/productos', { id: yerba, nombre: 'Yerba orgánica', precio_minorista: 100, precio_mayorista: 80, stock_minimo: 5, costo: 75 })).status, 200);
-  assert.equal((await api('GET', '/api/informe?mes=2026-11')).data.ventas.find(v => v.tipo === 'mayorista').ganancia, 200);
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-01&hasta=2026-11-30')).data.ventas.find(v => v.tipo === 'mayorista').ganancia, 200);
 
   // gastos
   assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-02', categoria: 'Mercadería', concepto: 'Nutryser', monto: 1000, medio_pago: 'transferencia' })).status, 200);
@@ -79,12 +79,12 @@ try {
   await api('POST', '/api/gastos', { fecha: '2026-10-20', categoria: 'Alquiler', monto: 9999, medio_pago: 'efectivo' }); // otro mes
   assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: 'Otros', monto: 0 })).status, 400);
   assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: '', monto: 10 })).status, 400);
-  assert.deepEqual((await api('GET', '/api/informe?mes=2026-11')).data.gastos,
+  assert.deepEqual((await api('GET', '/api/informe?desde=2026-11-01&hasta=2026-11-30')).data.gastos,
     [{ categoria: 'Mercadería', total: 1500 }, { categoria: 'Bolsitas y descartables', total: 50 }]);
   const gNov = (await api('GET', '/api/gastos?desde=2026-11-01&hasta=2026-11-31')).data;
   assert.equal(gNov.length, 3);
   await api('DELETE', '/api/gastos?id=' + gNov.find(g => g.monto === 500).id);
-  assert.equal((await api('GET', '/api/informe?mes=2026-11')).data.gastos[0].total, 1000);
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-01&hasta=2026-11-30')).data.gastos[0].total, 1000);
   assert.deepEqual(inf.faltantes.map(f => f.nombre).sort(), ['Miel', 'Viejo']); // yerba 6 > mín 5; miel 0.4 <= 1; viejo 0 <= 0
 
   const movs = (await api('GET', '/api/movimientos?desde=2026-11-01&hasta=2026-11-30')).data;
@@ -104,10 +104,16 @@ try {
   await api('POST', '/api/movimientos', { ...venta1, medio_pago: 'transferencia', items: [{ producto_id: yerba, cantidad: 2, precio_unitario: 100 }] });
   await api('POST', '/api/gastos', { fecha: '2026-11-03', categoria: 'Mercadería', concepto: 'reposición', monto: 150, medio_pago: 'efectivo' });
   await api('POST', '/api/gastos', { fecha: '2026-11-03', categoria: 'Mercadería', monto: 30, medio_pago: 'transferencia' });
-  const cierre = (await api('GET', '/api/cierre?fecha=2026-11-03')).data;
-  assert.deepEqual(Object.fromEntries(cierre.ventas.map(v => [v.medio_pago, v.total])), { efectivo: 400, transferencia: 200 });
-  assert.deepEqual(cierre.gastos.map(g => [g.medio_pago, g.monto]), [['efectivo', 150], ['transferencia', 30]]);
-  assert.equal((await api('GET', '/api/cierre?fecha=3-11')).status, 400);
+  const porMedio = filas => Object.fromEntries(filas.map(x => [x.medio_pago, x.total]));
+  const dia = (await api('GET', '/api/informe?desde=2026-11-03&hasta=2026-11-03')).data;
+  assert.deepEqual(porMedio(dia.ventas_medio), { efectivo: 400, transferencia: 200 });
+  assert.deepEqual(porMedio(dia.gastos_medio), { efectivo: 150, transferencia: 30 });
+  // semana lun 2 a dom 8: suma la mayorista del 5 (transferencia 800) y los gastos del 2 y del 4
+  const semana = (await api('GET', '/api/informe?desde=2026-11-02&hasta=2026-11-08')).data;
+  assert.deepEqual(porMedio(semana.ventas_medio), { efectivo: 400, transferencia: 1000 });
+  assert.deepEqual(porMedio(semana.gastos_medio), { efectivo: 200, transferencia: 1030 });
+  assert.equal((await api('GET', '/api/informe?desde=3-11&hasta=2026-11-03')).status, 400);
+  assert.equal((await api('GET', '/api/informe?mes=2026-11')).status, 400);
 
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);

@@ -182,40 +182,34 @@ const routes = {
     return { id: Number(r.lastInsertRowid) };
   },
 
-  // cierre de caja de un día: por medio de pago, ventas - gastos
-  'GET /api/cierre': async (_, q) => {
-    const fecha = q.get('fecha') ?? '';
-    check(/^\d{4}-\d{2}-\d{2}$/.test(fecha), 'Fecha inválida');
-    return {
-      ventas: await all(`SELECT medio_pago, SUM(-cantidad * precio_unitario) AS total
-        FROM movimientos WHERE fecha = ? AND tipo IN ('minorista','mayorista') GROUP BY medio_pago`, [fecha]),
-      gastos: await all('SELECT * FROM gastos WHERE fecha = ? ORDER BY id', [fecha]),
-    };
-  },
-
   'DELETE /api/gastos': async (_, q) => {
     const r = await db.execute({ sql: 'DELETE FROM gastos WHERE id = ?', args: [Number(q.get('id'))] });
     check(r.rowsAffected === 1, 'Gasto no encontrado');
     return { ok: true };
   },
 
+  // informe de un período (día, semana o mes): ?desde=AAAA-MM-DD&hasta=AAAA-MM-DD
   'GET /api/informe': async (_, q) => {
-    const mes = q.get('mes') ?? '';
-    check(/^\d{4}-\d{2}$/.test(mes), 'Mes inválido');
-    const like = [mes + '-%'];
+    const rango = [q.get('desde') ?? '', q.get('hasta') ?? ''];
+    check(rango.every(f => /^\d{4}-\d{2}-\d{2}$/.test(f)), 'Período inválido');
     return {
       // ganancia = (precio - costo al momento de la venta) x cantidad
       ventas: await all(`SELECT tipo, COUNT(*) AS lineas, SUM(-cantidad * precio_unitario) AS total,
           SUM(-cantidad * (precio_unitario - costo_unitario)) AS ganancia,
           SUM(costo_unitario = 0) AS sin_costo
-        FROM movimientos WHERE fecha LIKE ? AND tipo IN ('minorista','mayorista') GROUP BY tipo`, like),
-      gastos: await all(`SELECT categoria, SUM(monto) AS total FROM gastos WHERE fecha LIKE ?
-        GROUP BY categoria ORDER BY total DESC`, like),
+        FROM movimientos WHERE fecha BETWEEN ? AND ? AND tipo IN ('minorista','mayorista') GROUP BY tipo`, rango),
+      // cierre de caja: lo cobrado y lo pagado por cada medio de pago
+      ventas_medio: await all(`SELECT medio_pago, SUM(-cantidad * precio_unitario) AS total
+        FROM movimientos WHERE fecha BETWEEN ? AND ? AND tipo IN ('minorista','mayorista') GROUP BY medio_pago`, rango),
+      gastos_medio: await all(`SELECT medio_pago, SUM(monto) AS total FROM gastos WHERE fecha BETWEEN ? AND ?
+        GROUP BY medio_pago`, rango),
+      gastos: await all(`SELECT categoria, SUM(monto) AS total FROM gastos WHERE fecha BETWEEN ? AND ?
+        GROUP BY categoria ORDER BY total DESC`, rango),
       mas_vendidos: await all(`SELECT p.nombre, p.unidad, SUM(-m.cantidad) AS cantidad,
           SUM(-m.cantidad * m.precio_unitario) AS total, SUM(-m.cantidad * (m.precio_unitario - m.costo_unitario)) AS ganancia
         FROM movimientos m JOIN productos p ON p.id = m.producto_id
-        WHERE m.fecha LIKE ? AND m.tipo IN ('minorista','mayorista')
-        GROUP BY p.id ORDER BY total DESC`, like),
+        WHERE m.fecha BETWEEN ? AND ? AND m.tipo IN ('minorista','mayorista')
+        GROUP BY p.id ORDER BY total DESC`, rango),
       faltantes: await all(`SELECT nombre, unidad, stock, stock_minimo FROM stock
         WHERE activo = 1 AND stock <= stock_minimo ORDER BY stock - stock_minimo`),
     };
