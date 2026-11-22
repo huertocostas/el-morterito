@@ -225,9 +225,11 @@ export async function handler(req, res) {
     res.end(JSON.stringify(data));
   };
   // en Vercel la página la sirve public/ directamente; esto es para uso local
-  if (req.method === 'GET' && url.pathname === '/') {
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    return res.end(readFileSync(join(import.meta.dirname, 'public', 'index.html')));
+  const estatico = { '/': ['index.html', 'text/html; charset=utf-8'], '/logo.jpg': ['logo.jpg', 'image/jpeg'],
+    '/logo-chico.jpg': ['logo-chico.jpg', 'image/jpeg'] }[url.pathname];
+  if (req.method === 'GET' && estatico) {
+    res.setHeader('Content-Type', estatico[1]);
+    return res.end(readFileSync(join(import.meta.dirname, 'public', estatico[0])));
   }
   const key = `${req.method} ${url.pathname}`;
   const route = routes[key];
