@@ -90,6 +90,11 @@
   .total { display: flex; justify-content: space-between; align-items: baseline; }
   .total b { font-size: 28px; font-variant-numeric: tabular-nums; }
   button.big { padding: 13px; font-size: 17px; font-weight: 600; }
+  .seg.pago { display: flex; margin: 0; }
+  .seg.pago button { flex: 1; }
+  .seg.pago[hidden] { display: none; }
+  .cierre td:not(:first-child), .cierre th:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+  .cierre tr.neto td { font-weight: 600; font-size: 17px; border-bottom: 0; }
   button.primary:disabled { opacity: .5; cursor: default; }
   input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
   .ver-ticket { display: none; }
@@ -121,7 +126,7 @@
     .total { gap: 6px; }
     .total b { font-size: 22px; }
     #msgCargar:empty { display: none; }
-    #guardar, #msgCargar, #limpiar { grid-column: 1 / -1; }
+    #guardar, #msgCargar, #limpiar, .seg.pago { grid-column: 1 / -1; }
     .l-bot { flex-wrap: wrap; }
   }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
@@ -187,6 +192,10 @@
         <div class="ticket-foot">
           <button class="ver-ticket" id="verTicket" aria-expanded="false"></button>
           <div class="total" id="totalWrap"><span class="muted">Total</span><b id="total"></b></div>
+          <div class="seg pago" id="pago" role="group" aria-label="Medio de pago">
+            <button data-pago="efectivo" class="on" aria-pressed="true">Efectivo</button>
+            <button data-pago="transferencia" aria-pressed="false">Transferencia</button>
+          </div>
           <button class="primary big" id="guardar"></button>
           <button class="link" id="limpiar" style="justify-self:center;color:var(--muted)">Vaciar</button>
           <div class="msg" id="msgCargar" style="text-align:center;margin:0"></div>
@@ -269,6 +278,9 @@
         </label>
         <label style="flex:3 1 200px">Detalle<input name="concepto" placeholder="Ej.: Nutryser, bolsitas kraft…"></label>
         <label style="flex:1 1 120px">Monto<input name="monto" type="number" step="any" min="0" required></label>
+        <label style="flex:1 1 130px">Pagado con
+          <select name="medio_pago" required><option value="efectivo">Efectivo</option><option value="transferencia">Transferencia</option></select>
+        </label>
         <button class="primary">Guardar gasto</button>
       </form>
       <div class="msg" id="msgGasto"></div>
@@ -280,7 +292,7 @@
       </div>
       <div class="scroll">
         <table>
-          <thead><tr><th>Fecha</th><th>Categoría</th><th>Detalle</th><th class="n">Monto</th><th></th></tr></thead>
+          <thead><tr><th>Fecha</th><th>Categoría</th><th>Detalle</th><th>Pagado con</th><th class="n">Monto</th><th></th></tr></thead>
           <tbody id="tablaGastos"></tbody>
         </table>
       </div>
@@ -289,6 +301,17 @@
 
   <!-- INFORMES -->
   <section id="informes">
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:8px">
+        <h2 style="margin:0">Cierre de caja</h2>
+        <label class="noprint">Día<input type="date" id="cFecha"></label>
+      </div>
+      <div class="scroll"><table class="cierre">
+        <thead><tr><th></th><th>Efectivo</th><th>Transferencia</th></tr></thead>
+        <tbody id="cTabla"></tbody>
+      </table></div>
+      <p class="muted" id="cNota" style="margin:8px 0 0"></p>
+    </div>
     <div class="row noprint" style="margin-bottom:16px">
       <label>Mes<input type="month" id="iMes"></label>
       <button id="iVer">Ver</button>
@@ -417,6 +440,13 @@ const abrirTicket = abrir => {
   actualizarTotales();
 };
 $('#verTicket').onclick = () => abrirTicket(!$('.ticket').classList.contains('abierta'));
+let medio = 'efectivo';
+const MEDIO = { efectivo: 'Efectivo', transferencia: 'Transferencia' };
+function setMedio(m) {
+  medio = m;
+  document.querySelectorAll('#pago button').forEach(b => { b.classList.toggle('on', b.dataset.pago === m); b.setAttribute('aria-pressed', b.dataset.pago === m); });
+}
+$('#pago').onclick = e => { if (e.target.dataset.pago) setMedio(e.target.dataset.pago); };
 
 function setTipo(t) {
   tipo = t;
@@ -488,7 +518,7 @@ function actualizarTotales() {
     // aviso si la venta deja el stock negativo (se permite igual: el stock cargado puede estar mal)
     $('#warn' + i).textContent = esVenta() && l.cantidad > l.p.stock ? `Ojo: hay ${qty(l.p.stock)} ${l.p.unidad} en stock` : '';
   });
-  $('#totalWrap').hidden = !esVenta();
+  $('#totalWrap').hidden = $('#pago').hidden = !esVenta();
   $('#total').textContent = money(totalTicket());
   $('#guardar').textContent = BOTON[tipo] + (esVenta() && lineas.length ? ' ' + money(totalTicket()) : '');
   $('#guardar').disabled = !lineas.length;
@@ -516,9 +546,10 @@ $('#guardar').onclick = async () => {
   if (lineas.some(l => !l.cantidad)) return flash($('#msgCargar'), 'Hay un producto con cantidad 0.', true);
   const btn = $('#guardar'), total = totalTicket(); btn.disabled = true;
   try {
-    await api('POST', '/api/movimientos', { tipo, fecha: $('#fecha').value, items: lineas.map(l => ({ producto_id: l.p.id, cantidad: l.cantidad, precio_unitario: l.precio })) });
-    lineas = []; abrirTicket(false); pintarLineas(); await cargarProductos();
-    flash($('#msgCargar'), esVenta() ? `Venta guardada: ${money(total)}` : 'Guardado correctamente');
+    await api('POST', '/api/movimientos', { tipo, fecha: $('#fecha').value, medio_pago: medio, items: lineas.map(l => ({ producto_id: l.p.id, cantidad: l.cantidad, precio_unitario: l.precio })) });
+    const pagado = MEDIO[medio].toLowerCase();
+    lineas = []; setMedio('efectivo'); abrirTicket(false); pintarLineas(); await cargarProductos();
+    flash($('#msgCargar'), esVenta() ? `Venta guardada: ${money(total)} en ${pagado}` : 'Guardado correctamente');
     $('#msgCargar').classList.add('ok'); enfocarBusqueda();
   } catch (err) { flash($('#msgCargar'), err.message, true); btn.disabled = false; }
 };
@@ -528,7 +559,7 @@ async function verMovimientos() {
   const rows = await api('GET', `/api/movimientos?desde=${$('#mDesde').value}&hasta=${$('#mHasta').value}`);
   $('#tablaMov').innerHTML = rows.map(m => {
     const venta = m.tipo === 'minorista' || m.tipo === 'mayorista', c = venta ? -m.cantidad : m.cantidad;
-    return `<tr><td>${m.fecha.split('-').reverse().join('/')}</td><td>${TIPOS[m.tipo]}</td><td>${esc(m.nombre)}</td>
+    return `<tr><td>${m.fecha.split('-').reverse().join('/')}</td><td>${TIPOS[m.tipo]}${MEDIO[m.medio_pago] ? ` <span class="muted">· ${MEDIO[m.medio_pago]}</span>` : ''}</td><td>${esc(m.nombre)}</td>
       <td class="n">${qty(c)} ${esc(m.unidad)}</td><td class="n">${venta ? money(m.precio_unitario) : ''}</td>
       <td class="n">${venta ? money(c * m.precio_unitario) : ''}</td>
       <td class="n"><button class="link" data-id="${m.id}">Borrar</button></td></tr>`;
@@ -548,9 +579,9 @@ async function verGastos() {
   const rows = await api('GET', `/api/gastos?desde=${mes}-01&hasta=${mes}-31`);
   $('#gTotal').textContent = 'Total del mes: ' + money(rows.reduce((s, g) => s + g.monto, 0));
   $('#tablaGastos').innerHTML = rows.map(g => `<tr><td>${g.fecha.split('-').reverse().join('/')}</td><td>${esc(g.categoria)}</td>
-      <td>${esc(g.concepto)}</td><td class="n">${money(g.monto)}</td>
+      <td>${esc(g.concepto)}</td><td>${MEDIO[g.medio_pago] ?? ''}</td><td class="n">${money(g.monto)}</td>
       <td class="n"><button class="link" data-id="${g.id}">Borrar</button></td></tr>`).join('')
-    || '<tr><td colspan="5" class="muted">Sin gastos en el mes.</td></tr>';
+    || '<tr><td colspan="6" class="muted">Sin gastos en el mes.</td></tr>';
 }
 $('#gMes').onchange = verGastos;
 $('#formGasto').onsubmit = async e => {
@@ -569,8 +600,26 @@ $('#tablaGastos').onclick = async e => {
   try { await api('DELETE', '/api/gastos?id=' + id); await verGastos(); } catch (err) { alert(err.message); }
 };
 
+// ---------- cierre de caja ----------
+async function verCierre() {
+  const d = await api('GET', '/api/cierre?fecha=' + $('#cFecha').value);
+  const venta = m => d.ventas.find(v => v.medio_pago === m)?.total || 0;
+  const gasto = m => d.gastos.filter(g => g.medio_pago === m).reduce((s, g) => s + g.monto, 0);
+  const fila = (t, f, cls = '') => `<tr class="${cls}"><td>${t}</td>${['efectivo', 'transferencia'].map(m => {
+    const n = f(m); return `<td class="${n < 0 ? 'bad' : ''}">${money(n)}</td>`; }).join('')}</tr>`;
+  $('#cTabla').innerHTML = fila('Ventas', venta) + fila('− Gastos y reposición', m => -gasto(m))
+    + fila('Queda', m => venta(m) - gasto(m), 'neto');
+  const sinDato = venta('');
+  $('#cNota').textContent = [
+    d.gastos.length ? 'Gastos del día: ' + d.gastos.map(g => `${g.concepto || g.categoria} ${money(g.monto)} (${MEDIO[g.medio_pago]})`).join(', ') : 'Sin gastos ese día.',
+    sinDato ? `Hay ${money(sinDato)} en ventas sin medio de pago (cargadas antes de este cambio).` : '',
+  ].join(' ');
+}
+$('#cFecha').onchange = verCierre;
+
 // ---------- informes ----------
 async function verInforme() {
+  verCierre();
   const mes = $('#iMes').value, d = await api('GET', '/api/informe?mes=' + mes);
   const suma = k => d.ventas.reduce((s, x) => s + (x[k] || 0), 0);
   const v = t => d.ventas.find(x => x.tipo === t)?.total || 0;
@@ -594,7 +643,7 @@ $('#iVer').onclick = verInforme;
 // ---------- inicio ----------
 $('#fecha').value = hoy(); $('#mHasta').value = hoy();
 $('#mDesde').value = hoy().slice(0, 8) + '01'; $('#iMes').value = $('#gMes').value = hoy().slice(0, 7);
-$('#formGasto').fecha.value = hoy();
+$('#formGasto').fecha.value = $('#cFecha').value = hoy();
 $('#formLogin').onsubmit = async e => {
   e.preventDefault();
   try { await api('POST', '/api/login', { password: $('#pass').value }); location.reload(); }

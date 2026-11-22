@@ -46,16 +46,16 @@ try {
   assert.equal((await api('POST', '/api/productos', { nombre: 'yerba ORGÁNICA' })).status, 400, 'nombre duplicado');
 
   await api('POST', '/api/movimientos', { tipo: 'compra', fecha: '2026-11-01', items: [{ producto_id: yerba, cantidad: 20, precio_unitario: 60 }, { producto_id: miel, cantidad: 2.5, precio_unitario: 30 }] });
-  await api('POST', '/api/movimientos', { tipo: 'minorista', fecha: '2026-11-03', items: [{ producto_id: yerba, cantidad: 3, precio_unitario: 100 }, { producto_id: miel, cantidad: 2, precio_unitario: 50 }] });
-  await api('POST', '/api/movimientos', { tipo: 'mayorista', fecha: '2026-11-05', items: [{ producto_id: yerba, cantidad: 10, precio_unitario: 80 }] });
+  await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-03', items: [{ producto_id: yerba, cantidad: 3, precio_unitario: 100 }, { producto_id: miel, cantidad: 2, precio_unitario: 50 }] });
+  await api('POST', '/api/movimientos', { tipo: 'mayorista', medio_pago: 'transferencia', fecha: '2026-11-05', items: [{ producto_id: yerba, cantidad: 10, precio_unitario: 80 }] });
   await api('POST', '/api/movimientos', { tipo: 'ajuste', fecha: '2026-11-06', items: [{ producto_id: yerba, cantidad: -1 }] });
-  await api('POST', '/api/movimientos', { tipo: 'minorista', fecha: '2026-10-30', items: [{ producto_id: miel, cantidad: 0.1, precio_unitario: 50 }] }); // otro mes
+  await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-10-30', items: [{ producto_id: miel, cantidad: 0.1, precio_unitario: 50 }] }); // otro mes
 
   // validaciones: nada de esto debe guardarse
-  assert.equal((await api('POST', '/api/movimientos', { tipo: 'minorista', fecha: '2026-11-07', items: [{ producto_id: yerba, cantidad: -5, precio_unitario: 1 }] })).status, 400);
+  assert.equal((await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-07', items: [{ producto_id: yerba, cantidad: -5, precio_unitario: 1 }] })).status, 400);
   assert.equal((await api('POST', '/api/movimientos', { tipo: 'regalo', fecha: '2026-11-07', items: [{ producto_id: yerba, cantidad: 1 }] })).status, 400);
   // si un ítem falla, no se guarda ninguno de la misma venta
-  assert.equal((await api('POST', '/api/movimientos', { tipo: 'minorista', fecha: '2026-11-07', items: [{ producto_id: yerba, cantidad: 1, precio_unitario: 1 }, { producto_id: 999, cantidad: 1 }] })).status, 400);
+  assert.equal((await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-07', items: [{ producto_id: yerba, cantidad: 1, precio_unitario: 1 }, { producto_id: 999, cantidad: 1 }] })).status, 400);
 
   const stock = Object.fromEntries((await api('GET', '/api/productos')).data.map(p => [p.nombre, p.stock]));
   assert.equal(stock['Yerba orgánica'], 20 - 3 - 10 - 1);
@@ -73,10 +73,10 @@ try {
   assert.equal((await api('GET', '/api/informe?mes=2026-11')).data.ventas.find(v => v.tipo === 'mayorista').ganancia, 200);
 
   // gastos
-  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-02', categoria: 'Mercadería', concepto: 'Nutryser', monto: 1000 })).status, 200);
-  await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: 'Bolsitas y descartables', monto: 50 });
-  await api('POST', '/api/gastos', { fecha: '2026-11-09', categoria: 'Mercadería', monto: 500 });
-  await api('POST', '/api/gastos', { fecha: '2026-10-20', categoria: 'Alquiler', monto: 9999 }); // otro mes
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-02', categoria: 'Mercadería', concepto: 'Nutryser', monto: 1000, medio_pago: 'transferencia' })).status, 200);
+  await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: 'Bolsitas y descartables', monto: 50, medio_pago: 'efectivo' });
+  await api('POST', '/api/gastos', { fecha: '2026-11-09', categoria: 'Mercadería', monto: 500, medio_pago: 'efectivo' });
+  await api('POST', '/api/gastos', { fecha: '2026-10-20', categoria: 'Alquiler', monto: 9999, medio_pago: 'efectivo' }); // otro mes
   assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: 'Otros', monto: 0 })).status, 400);
   assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: '', monto: 10 })).status, 400);
   assert.deepEqual((await api('GET', '/api/informe?mes=2026-11')).data.gastos,
@@ -91,6 +91,23 @@ try {
   assert.equal(movs.length, 6);
   await api('DELETE', '/api/movimientos?id=' + movs.find(m => m.tipo === 'ajuste').id);
   assert.equal((await api('GET', '/api/productos')).data.find(p => p.id === yerba).stock, 7);
+
+  // medio de pago: obligatorio en ventas y gastos
+  const venta1 = { tipo: 'minorista', fecha: '2026-11-03', items: [{ producto_id: yerba, cantidad: 1, precio_unitario: 100 }] };
+  assert.equal((await api('POST', '/api/movimientos', venta1)).status, 400);
+  assert.equal((await api('POST', '/api/movimientos', { ...venta1, medio_pago: 'tarjeta' })).status, 400);
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-03', categoria: 'Otros', monto: 10 })).status, 400);
+  // compras y ajustes no llevan medio de pago
+  assert.equal((await api('POST', '/api/movimientos', { tipo: 'compra', fecha: '2026-11-03', items: [{ producto_id: yerba, cantidad: 1 }] })).status, 200);
+
+  // cierre del 3/11: efectivo = venta 400 (yerba 300 + miel 100); transferencia = 2 x 100
+  await api('POST', '/api/movimientos', { ...venta1, medio_pago: 'transferencia', items: [{ producto_id: yerba, cantidad: 2, precio_unitario: 100 }] });
+  await api('POST', '/api/gastos', { fecha: '2026-11-03', categoria: 'Mercadería', concepto: 'reposición', monto: 150, medio_pago: 'efectivo' });
+  await api('POST', '/api/gastos', { fecha: '2026-11-03', categoria: 'Mercadería', monto: 30, medio_pago: 'transferencia' });
+  const cierre = (await api('GET', '/api/cierre?fecha=2026-11-03')).data;
+  assert.deepEqual(Object.fromEntries(cierre.ventas.map(v => [v.medio_pago, v.total])), { efectivo: 400, transferencia: 200 });
+  assert.deepEqual(cierre.gastos.map(g => [g.medio_pago, g.monto]), [['efectivo', 150], ['transferencia', 30]]);
+  assert.equal((await api('GET', '/api/cierre?fecha=3-11')).status, 400);
 
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);

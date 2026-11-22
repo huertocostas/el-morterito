@@ -49,7 +49,9 @@ CREATE INDEX IF NOT EXISTS idx_gastos_fecha ON gastos(fecha);
 `);
   // columnas agregadas después de la primera versión (la base de Turso ya existe)
   for (const sql of ['ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0',
-    'ALTER TABLE movimientos ADD COLUMN costo_unitario REAL NOT NULL DEFAULT 0']) {
+    'ALTER TABLE movimientos ADD COLUMN costo_unitario REAL NOT NULL DEFAULT 0',
+    "ALTER TABLE movimientos ADD COLUMN medio_pago TEXT NOT NULL DEFAULT ''", // ventas viejas quedan sin dato
+    "ALTER TABLE gastos ADD COLUMN medio_pago TEXT NOT NULL DEFAULT 'efectivo'"]) {
     try { await db.execute(sql); } catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
   }
 })();
@@ -66,6 +68,7 @@ const num = (v, campo, min = 0) => {
   return n;
 };
 const VENTAS = ['minorista', 'mayorista'];
+const MEDIOS = ['efectivo', 'transferencia'];
 
 // ---------- login ----------
 // Sin APP_PASSWORD (uso local en la PC del negocio) no se pide contraseña.
@@ -129,6 +132,8 @@ const routes = {
     check(['minorista', 'mayorista', 'compra', 'ajuste'].includes(b.tipo), 'Tipo inválido');
     check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
     check(Array.isArray(b.items) && b.items.length, 'No hay productos cargados');
+    const venta = VENTAS.includes(b.tipo);
+    check(!venta || MEDIOS.includes(b.medio_pago), 'Elegí el medio de pago');
     const ids = [...new Set(b.items.map(it => Number(it.producto_id)))];
     check(ids.every(Number.isInteger), 'Producto inexistente');
     const existen = await all(`SELECT id, costo FROM productos WHERE id IN (${ids.map(() => '?')})`, ids);
@@ -141,9 +146,9 @@ const routes = {
       const cant = b.tipo === 'ajuste' ? num(it.cantidad, 'Cantidad', -Infinity) : num(it.cantidad, 'Cantidad');
       check(cant !== 0, 'La cantidad no puede ser 0');
       return {
-        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario) VALUES (?,?,?,?,?,?)',
-        args: [b.fecha, b.tipo, Number(it.producto_id), VENTAS.includes(b.tipo) ? -cant : cant, num(it.precio_unitario, 'Precio'),
-          costo[Number(it.producto_id)]],
+        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago) VALUES (?,?,?,?,?,?,?)',
+        args: [b.fecha, b.tipo, Number(it.producto_id), venta ? -cant : cant, num(it.precio_unitario, 'Precio'),
+          costo[Number(it.producto_id)], venta ? b.medio_pago : ''],
       };
     });
     await db.batch(stmts, 'write');
@@ -171,9 +176,21 @@ const routes = {
     check(categoria, 'Elegí una categoría');
     const monto = num(b.monto, 'Monto');
     check(monto > 0, 'El monto tiene que ser mayor a 0');
-    const r = await db.execute({ sql: 'INSERT INTO gastos (fecha, categoria, concepto, monto) VALUES (?,?,?,?)',
-      args: [b.fecha, categoria, String(b.concepto ?? '').trim(), monto] });
+    check(MEDIOS.includes(b.medio_pago), 'Elegí con qué se pagó');
+    const r = await db.execute({ sql: 'INSERT INTO gastos (fecha, categoria, concepto, monto, medio_pago) VALUES (?,?,?,?,?)',
+      args: [b.fecha, categoria, String(b.concepto ?? '').trim(), monto, b.medio_pago] });
     return { id: Number(r.lastInsertRowid) };
+  },
+
+  // cierre de caja de un día: por medio de pago, ventas - gastos
+  'GET /api/cierre': async (_, q) => {
+    const fecha = q.get('fecha') ?? '';
+    check(/^\d{4}-\d{2}-\d{2}$/.test(fecha), 'Fecha inválida');
+    return {
+      ventas: await all(`SELECT medio_pago, SUM(-cantidad * precio_unitario) AS total
+        FROM movimientos WHERE fecha = ? AND tipo IN ('minorista','mayorista') GROUP BY medio_pago`, [fecha]),
+      gastos: await all('SELECT * FROM gastos WHERE fecha = ? ORDER BY id', [fecha]),
+    };
   },
 
   'DELETE /api/gastos': async (_, q) => {
