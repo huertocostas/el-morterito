@@ -12,7 +12,7 @@ const db = createClient({
   authToken: process.env.TURSO_AUTH_TOKEN,
 });
 
-const listo = db.executeMultiple(`
+const listo = (async () => { await db.executeMultiple(`
 CREATE TABLE IF NOT EXISTS productos (
   id INTEGER PRIMARY KEY,
   nombre TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -37,7 +37,23 @@ CREATE VIEW IF NOT EXISTS stock AS
   SELECT p.*, COALESCE(SUM(m.cantidad), 0) AS stock
   FROM productos p LEFT JOIN movimientos m ON m.producto_id = p.id
   GROUP BY p.id;
+-- Egresos de plata (proveedores, bolsitas, alquiler...). Las compras de "Vender" solo mueven stock.
+CREATE TABLE IF NOT EXISTS gastos (
+  id INTEGER PRIMARY KEY,
+  fecha TEXT NOT NULL,
+  categoria TEXT NOT NULL,
+  concepto TEXT NOT NULL DEFAULT '',
+  monto REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_gastos_fecha ON gastos(fecha);
 `);
+  // columnas agregadas después de la primera versión (la base de Turso ya existe)
+  for (const sql of ['ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0',
+    'ALTER TABLE movimientos ADD COLUMN costo_unitario REAL NOT NULL DEFAULT 0']) {
+    try { await db.execute(sql); } catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
+  }
+})();
+listo.catch(() => {}); // el error se informa en cada pedido (await listo), no tira abajo el proceso
 
 const all = async (sql, args = []) => (await db.execute({ sql, args })).rows.map(r => ({ ...r }));
 const one = async (sql, args) => (await all(sql, args))[0];
@@ -90,6 +106,7 @@ const routes = {
       unidad: String(b.unidad ?? 'unidad').trim() || 'unidad',
       precio_minorista: num(b.precio_minorista, 'Precio minorista'),
       precio_mayorista: num(b.precio_mayorista, 'Precio mayorista'),
+      costo: num(b.costo, 'Costo'),
       stock_minimo: num(b.stock_minimo, 'Stock mínimo'),
       activo: b.activo === false || b.activo === 0 ? 0 : 1,
     };
@@ -114,16 +131,19 @@ const routes = {
     check(Array.isArray(b.items) && b.items.length, 'No hay productos cargados');
     const ids = [...new Set(b.items.map(it => Number(it.producto_id)))];
     check(ids.every(Number.isInteger), 'Producto inexistente');
-    const existen = await all(`SELECT id FROM productos WHERE id IN (${ids.map(() => '?')})`, ids);
+    const existen = await all(`SELECT id, costo FROM productos WHERE id IN (${ids.map(() => '?')})`, ids);
     check(existen.length === ids.length, 'Producto inexistente');
+    // el costo se guarda en cada venta: si después cambia, la ganancia de meses anteriores no se altera
+    const costo = Object.fromEntries(existen.map(p => [p.id, p.costo]));
     // se valida todo antes de escribir; batch = todo o nada
     const stmts = b.items.map(it => {
       // En ajustes la cantidad viene con signo (+ sobrante, - faltante); en el resto, positiva.
       const cant = b.tipo === 'ajuste' ? num(it.cantidad, 'Cantidad', -Infinity) : num(it.cantidad, 'Cantidad');
       check(cant !== 0, 'La cantidad no puede ser 0');
       return {
-        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario) VALUES (?,?,?,?,?)',
-        args: [b.fecha, b.tipo, Number(it.producto_id), VENTAS.includes(b.tipo) ? -cant : cant, num(it.precio_unitario, 'Precio')],
+        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario) VALUES (?,?,?,?,?,?)',
+        args: [b.fecha, b.tipo, Number(it.producto_id), VENTAS.includes(b.tipo) ? -cant : cant, num(it.precio_unitario, 'Precio'),
+          costo[Number(it.producto_id)]],
       };
     });
     await db.batch(stmts, 'write');
@@ -141,17 +161,41 @@ const routes = {
     return { ok: true };
   },
 
+  'GET /api/gastos': (_, q) =>
+    all('SELECT * FROM gastos WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC, id DESC',
+      [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99']),
+
+  'POST /api/gastos': async (b) => {
+    check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
+    const categoria = String(b.categoria ?? '').trim();
+    check(categoria, 'Elegí una categoría');
+    const monto = num(b.monto, 'Monto');
+    check(monto > 0, 'El monto tiene que ser mayor a 0');
+    const r = await db.execute({ sql: 'INSERT INTO gastos (fecha, categoria, concepto, monto) VALUES (?,?,?,?)',
+      args: [b.fecha, categoria, String(b.concepto ?? '').trim(), monto] });
+    return { id: Number(r.lastInsertRowid) };
+  },
+
+  'DELETE /api/gastos': async (_, q) => {
+    const r = await db.execute({ sql: 'DELETE FROM gastos WHERE id = ?', args: [Number(q.get('id'))] });
+    check(r.rowsAffected === 1, 'Gasto no encontrado');
+    return { ok: true };
+  },
+
   'GET /api/informe': async (_, q) => {
     const mes = q.get('mes') ?? '';
     check(/^\d{4}-\d{2}$/.test(mes), 'Mes inválido');
     const like = [mes + '-%'];
     return {
-      ventas: await all(`SELECT tipo, COUNT(*) AS lineas, SUM(-cantidad * precio_unitario) AS total
+      // ganancia = (precio - costo al momento de la venta) x cantidad
+      ventas: await all(`SELECT tipo, COUNT(*) AS lineas, SUM(-cantidad * precio_unitario) AS total,
+          SUM(-cantidad * (precio_unitario - costo_unitario)) AS ganancia,
+          SUM(costo_unitario = 0) AS sin_costo
         FROM movimientos WHERE fecha LIKE ? AND tipo IN ('minorista','mayorista') GROUP BY tipo`, like),
-      compras: (await one(`SELECT COALESCE(SUM(cantidad * precio_unitario), 0) AS total
-        FROM movimientos WHERE fecha LIKE ? AND tipo = 'compra'`, like)).total,
+      gastos: await all(`SELECT categoria, SUM(monto) AS total FROM gastos WHERE fecha LIKE ?
+        GROUP BY categoria ORDER BY total DESC`, like),
       mas_vendidos: await all(`SELECT p.nombre, p.unidad, SUM(-m.cantidad) AS cantidad,
-          SUM(-m.cantidad * m.precio_unitario) AS total
+          SUM(-m.cantidad * m.precio_unitario) AS total, SUM(-m.cantidad * (m.precio_unitario - m.costo_unitario)) AS ganancia
         FROM movimientos m JOIN productos p ON p.id = m.producto_id
         WHERE m.fecha LIKE ? AND m.tipo IN ('minorista','mayorista')
         GROUP BY p.id ORDER BY total DESC`, like),

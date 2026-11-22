@@ -94,7 +94,7 @@
     header { padding: 8px; gap: 4px 6px; flex-wrap: nowrap; }
     header h1 { display: none; } /* el espacio es para que entren las 4 secciones */
     nav { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; gap: 2px; }
-    nav button { padding: 6px 7px; font-size: 14px; white-space: nowrap; }
+    nav button { padding: 6px 5px; font-size: 13.5px; white-space: nowrap; }
     #salir { padding: 5px 8px; font-size: 13px; }
     main { padding: 12px 12px 150px; }
     .pos { grid-template-columns: 1fr; }
@@ -140,7 +140,8 @@
   <nav>
     <button data-tab="cargar" class="on">Vender</button>
     <button data-tab="productos">Productos</button>
-    <button data-tab="movimientos">Movimientos</button>
+    <button data-tab="movimientos">Historial</button>
+    <button data-tab="gastos">Gastos</button>
     <button data-tab="informes">Informes</button>
   </nav>
   <button id="salir" hidden>Salir</button>
@@ -202,6 +203,7 @@
           </label>
         </div>
         <div class="row" style="margin-top:10px">
+          <label style="flex:1 1 120px">Costo<input name="costo" type="number" step="any" min="0" placeholder="lo que te cuesta"></label>
           <label style="flex:1 1 120px">Precio minorista<input name="precio_minorista" type="number" step="any" min="0"></label>
           <label style="flex:1 1 120px">Precio mayorista<input name="precio_mayorista" type="number" step="any" min="0"></label>
           <label style="flex:1 1 120px">Stock mínimo<input name="stock_minimo" type="number" step="any" min="0"></label>
@@ -223,7 +225,7 @@
       </div>
       <div class="scroll">
         <table>
-          <thead><tr><th>Producto</th><th>Categoría</th><th class="n">Stock</th><th class="n">Mínimo</th><th class="n">Minorista</th><th class="n">Mayorista</th></tr></thead>
+          <thead><tr><th>Producto</th><th>Categoría</th><th class="n">Stock</th><th class="n">Mínimo</th><th class="n">Costo</th><th class="n">Minorista</th><th class="n">Mayorista</th><th class="n">Ganás (min.)</th></tr></thead>
           <tbody id="tablaProd"></tbody>
         </table>
       </div>
@@ -247,6 +249,38 @@
     </div>
   </section>
 
+  <!-- GASTOS -->
+  <section id="gastos">
+    <div class="card">
+      <h2>Registrar gasto</h2>
+      <form class="row" id="formGasto">
+        <label style="flex:1 1 130px">Fecha<input type="date" name="fecha" required></label>
+        <label style="flex:1 1 170px">Categoría
+          <select name="categoria" required>
+            <option>Mercadería</option><option>Bolsitas y descartables</option><option>Alquiler</option>
+            <option>Servicios</option><option>Sueldos</option><option>Impuestos</option><option>Marketing</option><option>Otros</option>
+          </select>
+        </label>
+        <label style="flex:3 1 200px">Detalle<input name="concepto" placeholder="Ej.: Nutryser, bolsitas kraft…"></label>
+        <label style="flex:1 1 120px">Monto<input name="monto" type="number" step="any" min="0" required></label>
+        <button class="primary">Guardar gasto</button>
+      </form>
+      <div class="msg" id="msgGasto"></div>
+    </div>
+    <div class="card">
+      <div class="row" style="justify-content:space-between;margin-bottom:10px">
+        <label>Mes<input type="month" id="gMes"></label>
+        <b id="gTotal"></b>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Fecha</th><th>Categoría</th><th>Detalle</th><th class="n">Monto</th><th></th></tr></thead>
+          <tbody id="tablaGastos"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <!-- INFORMES -->
   <section id="informes">
     <div class="row noprint" style="margin-bottom:16px">
@@ -256,6 +290,12 @@
     </div>
     <h2 id="iTitulo"></h2>
     <div class="stats" id="iStats"></div>
+    <p class="muted" id="iAviso"></p>
+    <h3>Gastos del mes por categoría</h3>
+    <div class="card scroll"><table>
+      <thead><tr><th>Categoría</th><th class="n">Monto</th></tr></thead>
+      <tbody id="iGastos"></tbody>
+    </table></div>
     <h3>Faltantes (stock en o por debajo del mínimo)</h3>
     <div class="card scroll"><table>
       <thead><tr><th>Producto</th><th class="n">Stock actual</th><th class="n">Mínimo</th></tr></thead>
@@ -263,7 +303,7 @@
     </table></div>
     <h3>Lo más vendido del mes</h3>
     <div class="card scroll"><table>
-      <thead><tr><th>#</th><th>Producto</th><th class="n">Cantidad</th><th class="n">Importe</th></tr></thead>
+      <thead><tr><th>#</th><th>Producto</th><th class="n">Cantidad</th><th class="n">Importe</th><th class="n">Ganancia</th></tr></thead>
       <tbody id="iTop"></tbody>
     </table></div>
   </section>
@@ -279,7 +319,7 @@ const TIPOS = { minorista: 'Venta minorista', mayorista: 'Venta mayorista', comp
 const AYUDA = {
   minorista: 'Tocá un producto o escribí y apretá Enter. Cantidad y precio se pueden cambiar en el ticket.',
   mayorista: 'Tocá un producto o escribí y apretá Enter. Se usa el precio mayorista.',
-  compra: 'Mercadería que entra. Poné el costo unitario (opcional, sirve para ver cuánto se gastó en el mes).',
+  compra: 'Mercadería que entra: solo suma stock. Lo que pagaste al proveedor cargalo en "Gastos".',
   ajuste: 'Para corregir el stock después de contar: cantidad positiva si sobra, negativa si falta (rotura, vencido).',
 };
 
@@ -296,7 +336,7 @@ function flash(el, text, bad) { el.textContent = text; el.className = 'msg ' + (
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button, main > section').forEach(x => x.classList.remove('on'));
   b.classList.add('on'); $('#' + b.dataset.tab).classList.add('on');
-  ({ movimientos: verMovimientos, informes: verInforme })[b.dataset.tab]?.();
+  ({ movimientos: verMovimientos, gastos: verGastos, informes: verInforme })[b.dataset.tab]?.();
 });
 
 // ---------- productos ----------
@@ -315,15 +355,23 @@ function pintarProductos() {
     .map(p => `<tr class="click ${p.activo && p.stock <= p.stock_minimo ? 'bajo' : ''}" data-id="${p.id}">
       <td>${esc(p.nombre)}${p.activo ? '' : ' <span class="muted">(inactivo)</span>'}</td><td>${esc(p.categoria)}</td>
       <td class="n">${qty(p.stock)} ${esc(p.unidad)}</td><td class="n">${qty(p.stock_minimo)}</td>
-      <td class="n">${money(p.precio_minorista)}</td><td class="n">${money(p.precio_mayorista)}</td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">Sin productos.</td></tr>';
+      <td class="n">${p.costo ? money(p.costo) : '<span class="muted">—</span>'}</td>
+      <td class="n">${money(p.precio_minorista)}</td><td class="n">${money(p.precio_mayorista)}</td>
+      <td class="n">${margen(p)}</td></tr>`).join('')
+    || '<tr><td colspan="8" class="muted">Sin productos.</td></tr>';
+}
+// lo que se gana por unidad vendida a precio minorista
+function margen(p) {
+  if (!p.costo) return '<span class="muted">cargá el costo</span>';
+  const g = p.precio_minorista - p.costo;
+  return `${money(g)} <span class="muted">(${p.precio_minorista ? Math.round(g / p.precio_minorista * 100) : 0}%)</span>`;
 }
 $('#buscar').oninput = pintarProductos;
 $('#tablaProd').onclick = e => {
   const p = productos.find(p => p.id == e.target.closest('tr')?.dataset.id);
   if (!p) return;
   const f = $('#formProd');
-  for (const k of ['id', 'nombre', 'categoria', 'unidad', 'precio_minorista', 'precio_mayorista', 'stock_minimo']) f[k].value = p[k];
+  for (const k of ['id', 'nombre', 'categoria', 'unidad', 'costo', 'precio_minorista', 'precio_mayorista', 'stock_minimo']) f[k].value = p[k];
   f.activo.checked = !!p.activo;
   $('#pTitulo').textContent = 'Editar: ' + p.nombre;
   $('#stockIniWrap').hidden = true; $('#activoWrap').hidden = false; $('#pCancelar').hidden = false;
@@ -420,7 +468,7 @@ function pintarLineas() {
       <div class="l-bot">
         <div class="qty"><button data-paso="-1" data-i="${i}" aria-label="Uno menos">−</button><input type="number" step="any" data-cant="${i}" value="${l.cantidad}" aria-label="Cantidad"><button data-paso="1" data-i="${i}" aria-label="Uno más">+</button></div>
         <span class="muted">${esc(l.p.unidad)}</span>
-        ${tipo === 'ajuste' ? '' : `<label class="precio">× $<input type="number" step="any" min="0" data-precio="${i}" value="${l.precio}" aria-label="Precio unitario"></label>
+        ${!esVenta() ? '' : `<label class="precio">× $<input type="number" step="any" min="0" data-precio="${i}" value="${l.precio}" aria-label="Precio unitario"></label>
         <b class="l-sub" id="sub${i}"></b>`}
       </div>
       <div class="warn bad" id="warn${i}"></div></div>`).join('')
@@ -434,7 +482,7 @@ function actualizarTotales() {
     // aviso si la venta deja el stock negativo (se permite igual: el stock cargado puede estar mal)
     $('#warn' + i).textContent = esVenta() && l.cantidad > l.p.stock ? `Ojo: hay ${qty(l.p.stock)} ${l.p.unidad} en stock` : '';
   });
-  $('#totalWrap').hidden = tipo === 'ajuste';
+  $('#totalWrap').hidden = !esVenta();
   $('#total').textContent = money(totalTicket());
   $('#guardar').textContent = BOTON[tipo] + (esVenta() && lineas.length ? ' ' + money(totalTicket()) : '');
   $('#guardar').disabled = !lineas.length;
@@ -473,10 +521,10 @@ $('#guardar').onclick = async () => {
 async function verMovimientos() {
   const rows = await api('GET', `/api/movimientos?desde=${$('#mDesde').value}&hasta=${$('#mHasta').value}`);
   $('#tablaMov').innerHTML = rows.map(m => {
-    const c = m.tipo === 'minorista' || m.tipo === 'mayorista' ? -m.cantidad : m.cantidad;
+    const venta = m.tipo === 'minorista' || m.tipo === 'mayorista', c = venta ? -m.cantidad : m.cantidad;
     return `<tr><td>${m.fecha.split('-').reverse().join('/')}</td><td>${TIPOS[m.tipo]}</td><td>${esc(m.nombre)}</td>
-      <td class="n">${qty(c)} ${esc(m.unidad)}</td><td class="n">${m.tipo === 'ajuste' ? '' : money(m.precio_unitario)}</td>
-      <td class="n">${m.tipo === 'ajuste' ? '' : money(c * m.precio_unitario)}</td>
+      <td class="n">${qty(c)} ${esc(m.unidad)}</td><td class="n">${venta ? money(m.precio_unitario) : ''}</td>
+      <td class="n">${venta ? money(c * m.precio_unitario) : ''}</td>
       <td class="n"><button class="link" data-id="${m.id}">Borrar</button></td></tr>`;
   }).join('') || '<tr><td colspan="7" class="muted">Sin movimientos en esas fechas.</td></tr>';
 }
@@ -488,24 +536,59 @@ $('#tablaMov').onclick = async e => {
   catch (err) { alert(err.message); }
 };
 
+// ---------- gastos ----------
+async function verGastos() {
+  const mes = $('#gMes').value;
+  const rows = await api('GET', `/api/gastos?desde=${mes}-01&hasta=${mes}-31`);
+  $('#gTotal').textContent = 'Total del mes: ' + money(rows.reduce((s, g) => s + g.monto, 0));
+  $('#tablaGastos').innerHTML = rows.map(g => `<tr><td>${g.fecha.split('-').reverse().join('/')}</td><td>${esc(g.categoria)}</td>
+      <td>${esc(g.concepto)}</td><td class="n">${money(g.monto)}</td>
+      <td class="n"><button class="link" data-id="${g.id}">Borrar</button></td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Sin gastos en el mes.</td></tr>';
+}
+$('#gMes').onchange = verGastos;
+$('#formGasto').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, data = Object.fromEntries(new FormData(f));
+  try {
+    await api('POST', '/api/gastos', data);
+    flash($('#msgGasto'), `Gasto guardado: ${money(data.monto)}`); $('#msgGasto').classList.add('ok');
+    f.concepto.value = ''; f.monto.value = '';
+    $('#gMes').value = data.fecha.slice(0, 7); await verGastos();
+  } catch (err) { flash($('#msgGasto'), err.message, true); }
+};
+$('#tablaGastos').onclick = async e => {
+  const id = e.target.dataset.id;
+  if (!id || !confirm('¿Borrar este gasto?')) return;
+  try { await api('DELETE', '/api/gastos?id=' + id); await verGastos(); } catch (err) { alert(err.message); }
+};
+
 // ---------- informes ----------
 async function verInforme() {
   const mes = $('#iMes').value, d = await api('GET', '/api/informe?mes=' + mes);
+  const suma = k => d.ventas.reduce((s, x) => s + (x[k] || 0), 0);
   const v = t => d.ventas.find(x => x.tipo === t)?.total || 0;
+  const ventas = suma('total'), ganancia = suma('ganancia'), gastos = d.gastos.reduce((s, g) => s + g.total, 0);
   const nombreMes = new Date(mes + '-02').toLocaleDateString('es-AR', { month: 'long', year: 'numeric' });
   $('#iTitulo').textContent = 'Informe de ' + nombreMes;
-  $('#iStats').innerHTML = [['Ventas totales', v('minorista') + v('mayorista')], ['Minorista', v('minorista')],
-    ['Mayorista', v('mayorista')], ['Compras', d.compras]].map(([t, n]) => `<div class="stat"><span class="muted">${t}</span><b>${money(n)}</b></div>`).join('');
+  $('#iStats').innerHTML = [['Ventas totales', ventas], ['Minorista', v('minorista')], ['Mayorista', v('mayorista')],
+    ['Ganancia de las ventas', ganancia], ['Gastos', gastos], ['Resultado (ventas − gastos)', ventas - gastos]]
+    .map(([t, n]) => `<div class="stat"><span class="muted">${t}</span><b class="${n < 0 ? 'bad' : ''}">${money(n)}</b></div>`).join('');
+  const sinCosto = suma('sin_costo');
+  $('#iAviso').textContent = sinCosto ? `Ojo: ${sinCosto} venta(s) de productos sin costo cargado cuentan como ganancia completa.` : '';
+  $('#iGastos').innerHTML = d.gastos.map(g => `<tr><td>${esc(g.categoria)}</td><td class="n">${money(g.total)}</td></tr>`).join('')
+    || '<tr><td colspan="2" class="muted">Sin gastos en el mes.</td></tr>';
   $('#iFaltan').innerHTML = d.faltantes.map(f => `<tr><td>${esc(f.nombre)}</td><td class="n bad">${qty(f.stock)} ${esc(f.unidad)}</td><td class="n">${qty(f.stock_minimo)}</td></tr>`).join('')
     || '<tr><td colspan="3" class="muted">No hay faltantes.</td></tr>';
-  $('#iTop').innerHTML = d.mas_vendidos.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.nombre)}</td><td class="n">${qty(r.cantidad)} ${esc(r.unidad)}</td><td class="n">${money(r.total)}</td></tr>`).join('')
-    || '<tr><td colspan="4" class="muted">Sin ventas en el mes.</td></tr>';
+  $('#iTop').innerHTML = d.mas_vendidos.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.nombre)}</td><td class="n">${qty(r.cantidad)} ${esc(r.unidad)}</td><td class="n">${money(r.total)}</td><td class="n">${money(r.ganancia)}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Sin ventas en el mes.</td></tr>';
 }
 $('#iVer').onclick = verInforme;
 
 // ---------- inicio ----------
 $('#fecha').value = hoy(); $('#mHasta').value = hoy();
-$('#mDesde').value = hoy().slice(0, 8) + '01'; $('#iMes').value = hoy().slice(0, 7);
+$('#mDesde').value = hoy().slice(0, 8) + '01'; $('#iMes').value = $('#gMes').value = hoy().slice(0, 7);
+$('#formGasto').fecha.value = hoy();
 $('#formLogin').onsubmit = async e => {
   e.preventDefault();
   try { await api('POST', '/api/login', { password: $('#pass').value }); location.reload(); }

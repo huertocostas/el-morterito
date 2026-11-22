@@ -9,3 +9,8 @@
 node_modules/
 .vercel/
 .env*
+# Material del cliente (audios, imágenes)
+*.ogg
+*.jpeg
+*.jpg
+*.png

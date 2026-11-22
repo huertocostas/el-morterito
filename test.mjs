@@ -3,9 +3,22 @@ import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { rmSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
+import { createClient } from '@libsql/client';
 
 const DB = join(tmpdir(), `morterito-test-${Date.now()}.db`), PORT = 3999;
+// base con el esquema de la primera versión (sin costo), como la que ya existe en Turso
+const vieja = createClient({ url: pathToFileURL(DB).href });
+await vieja.executeMultiple(`
+CREATE TABLE productos (id INTEGER PRIMARY KEY, nombre TEXT NOT NULL UNIQUE COLLATE NOCASE, categoria TEXT NOT NULL DEFAULT '',
+  unidad TEXT NOT NULL DEFAULT 'unidad', precio_minorista REAL NOT NULL DEFAULT 0, precio_mayorista REAL NOT NULL DEFAULT 0,
+  stock_minimo REAL NOT NULL DEFAULT 0, activo INTEGER NOT NULL DEFAULT 1);
+CREATE TABLE movimientos (id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, tipo TEXT NOT NULL, producto_id INTEGER NOT NULL,
+  cantidad REAL NOT NULL, precio_unitario REAL NOT NULL DEFAULT 0);
+CREATE VIEW stock AS SELECT p.*, COALESCE(SUM(m.cantidad), 0) AS stock FROM productos p LEFT JOIN movimientos m ON m.producto_id = p.id GROUP BY p.id;
+INSERT INTO productos (nombre) VALUES ('Viejo');`);
+vieja.close();
 const srv = spawn(process.execPath, [join(import.meta.dirname, 'server.mjs')],
   { env: { ...process.env, MORTERITO_DB: DB, PORT, APP_PASSWORD: 'clave-test', TURSO_DATABASE_URL: '' } });
 srv.stderr.pipe(process.stderr);
@@ -26,7 +39,9 @@ try {
   assert.equal((await api('POST', '/api/login', { password: 'clave-test' })).status, 200);
   assert.equal((await api('GET', '/api/productos')).status, 200);
 
-  const { data: { id: yerba } } = await api('POST', '/api/productos', { nombre: 'Yerba orgánica', precio_minorista: 100, precio_mayorista: 80, stock_minimo: 5 });
+  // la base vieja se migró: el producto que ya existía tiene costo 0
+  assert.equal((await api('GET', '/api/productos')).data.find(p => p.nombre === 'Viejo').costo, 0);
+  const { data: { id: yerba } } = await api('POST', '/api/productos', { nombre: 'Yerba orgánica', precio_minorista: 100, precio_mayorista: 80, stock_minimo: 5, costo: 60 });
   const { data: { id: miel } } = await api('POST', '/api/productos', { nombre: 'Miel', unidad: 'kg', precio_minorista: 50, stock_minimo: 1 });
   assert.equal((await api('POST', '/api/productos', { nombre: 'yerba ORGÁNICA' })).status, 400, 'nombre duplicado');
 
@@ -48,9 +63,29 @@ try {
 
   const inf = (await api('GET', '/api/informe?mes=2026-11')).data;
   assert.deepEqual(Object.fromEntries(inf.ventas.map(v => [v.tipo, v.total])), { minorista: 400, mayorista: 800 });
-  assert.equal(inf.compras, 20 * 60 + 2.5 * 30);
-  assert.deepEqual(inf.mas_vendidos.map(r => [r.nombre, r.cantidad]), [['Yerba orgánica', 13], ['Miel', 2]]);
-  assert.deepEqual(inf.faltantes.map(f => f.nombre).sort(), ['Miel']); // yerba 6 > mín 5; miel 0.4 <= 1
+  // yerba cuesta 60: minorista 3x40 + miel sin costo 2x50 = 220; mayorista 10x20 = 200
+  assert.deepEqual(Object.fromEntries(inf.ventas.map(v => [v.tipo, v.ganancia])), { minorista: 220, mayorista: 200 });
+  assert.deepEqual(Object.fromEntries(inf.ventas.map(v => [v.tipo, v.sin_costo])), { minorista: 1, mayorista: 0 });
+  assert.deepEqual(inf.mas_vendidos.map(r => [r.nombre, r.cantidad, r.ganancia]), [['Yerba orgánica', 13, 320], ['Miel', 2, 100]]);
+
+  // cambiar el costo después no altera la ganancia ya registrada
+  assert.equal((await api('POST', '/api/productos', { id: yerba, nombre: 'Yerba orgánica', precio_minorista: 100, precio_mayorista: 80, stock_minimo: 5, costo: 75 })).status, 200);
+  assert.equal((await api('GET', '/api/informe?mes=2026-11')).data.ventas.find(v => v.tipo === 'mayorista').ganancia, 200);
+
+  // gastos
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-02', categoria: 'Mercadería', concepto: 'Nutryser', monto: 1000 })).status, 200);
+  await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: 'Bolsitas y descartables', monto: 50 });
+  await api('POST', '/api/gastos', { fecha: '2026-11-09', categoria: 'Mercadería', monto: 500 });
+  await api('POST', '/api/gastos', { fecha: '2026-10-20', categoria: 'Alquiler', monto: 9999 }); // otro mes
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: 'Otros', monto: 0 })).status, 400);
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: '', monto: 10 })).status, 400);
+  assert.deepEqual((await api('GET', '/api/informe?mes=2026-11')).data.gastos,
+    [{ categoria: 'Mercadería', total: 1500 }, { categoria: 'Bolsitas y descartables', total: 50 }]);
+  const gNov = (await api('GET', '/api/gastos?desde=2026-11-01&hasta=2026-11-31')).data;
+  assert.equal(gNov.length, 3);
+  await api('DELETE', '/api/gastos?id=' + gNov.find(g => g.monto === 500).id);
+  assert.equal((await api('GET', '/api/informe?mes=2026-11')).data.gastos[0].total, 1000);
+  assert.deepEqual(inf.faltantes.map(f => f.nombre).sort(), ['Miel', 'Viejo']); // yerba 6 > mín 5; miel 0.4 <= 1; viejo 0 <= 0
 
   const movs = (await api('GET', '/api/movimientos?desde=2026-11-01&hasta=2026-11-30')).data;
   assert.equal(movs.length, 6);
