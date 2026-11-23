@@ -137,6 +137,12 @@
   .login form { width: 100%; max-width: 340px; display: grid; gap: 12px; }
   .login h2 { margin: 0; justify-self: center; }
   .login h2 img { display: block; width: 150px; height: 150px; border-radius: 50%; }
+  dialog { border: 0; border-radius: 12px; padding: 20px; width: min(360px, calc(100vw - 32px)); background: var(--card); color: var(--ink); }
+  dialog::backdrop { background: rgba(30, 28, 20, .45); }
+  dialog form { display: grid; gap: 12px; }
+  dialog h2 { margin: 0; }
+  dialog input { font-size: 20px; }
+  .stat .link { padding: 4px 0 0; font-size: 13px; color: var(--accent); }
   #salir { margin-left: auto; background: transparent; color: inherit; border-color: rgba(255,255,255,.4); }
   @media print {
     header, .noprint { display: none !important; }
@@ -156,6 +162,17 @@
   </nav>
   <button id="salir" hidden>Salir</button>
 </header>
+
+<dialog id="dlgApertura" aria-labelledby="aperturaTitulo">
+  <form id="formApertura">
+    <h2 id="aperturaTitulo">Abrir caja</h2>
+    <p class="muted" id="aperturaFecha" style="margin:0"></p>
+    <label>¿Con cuánto efectivo empezás?<input type="number" name="monto" min="0" step="any" inputmode="decimal" required></label>
+    <button class="primary big">Abrir caja</button>
+    <button type="button" class="link" id="aperturaCancelar" hidden style="color:var(--muted)">Cancelar</button>
+    <div class="msg" id="msgApertura" style="margin:0"></div>
+  </form>
+</dialog>
 
 <div class="login" id="login" hidden>
   <form class="card" id="formLogin">
@@ -605,13 +622,47 @@ function rango() {
   const lunes = new Date(y, m - 1, dd - (d.getDay() + 6) % 7), domingo = new Date(lunes.getFullYear(), lunes.getMonth(), lunes.getDate() + 6);
   return { desde: iso(lunes), hasta: iso(domingo), titulo: `Semana del ${fechaLarga(lunes, { day: 'numeric', month: 'short' })} al ${fechaLarga(domingo, { day: 'numeric', month: 'short' })}` };
 }
-const stat = (t, n, sub = '') => `<div class="stat"><span class="muted">${t}</span><b class="${n < 0 ? 'bad' : ''}">${money(n)}</b>${sub ? `<small>${sub}</small>` : ''}</div>`;
+const stat = (t, n, sub = '', extra = '') => `<div class="stat"><span class="muted">${t}</span><b class="${n < 0 ? 'bad' : ''}">${money(n)}</b>${sub ? `<small>${sub}</small>` : ''}${extra}</div>`;
 document.querySelectorAll('#iPeriodo button').forEach(b => b.onclick = () => {
   periodo = b.dataset.p;
   document.querySelectorAll('#iPeriodo button').forEach(x => x.classList.toggle('on', x === b));
   verInforme();
 });
 $('#iFecha').onchange = verInforme;
+$('#iCaja').onclick = e => {
+  const b = e.target.closest('[data-apertura]');
+  if (b) abrirApertura(b.dataset.apertura, b.dataset.monto === '' ? null : Number(b.dataset.monto), true);
+};
+
+// ---------- apertura de caja ----------
+// al entrar, si hoy no se abrió la caja, se pide el efectivo inicial (obligatorio; puede ser 0)
+const dlgApertura = $('#dlgApertura');
+function abrirApertura(fecha, monto = null, opcional = false) {
+  const [y, m, d] = fecha.split('-').map(Number);
+  Object.assign(dlgApertura.dataset, { fecha, opcional: opcional ? '1' : '', listo: '' });
+  $('#aperturaTitulo').textContent = monto == null ? 'Abrir caja' : 'Corregir apertura';
+  $('#aperturaFecha').textContent = new Date(y, m - 1, d).toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long' });
+  $('#aperturaCancelar').hidden = !opcional;
+  $('#formApertura').monto.value = monto ?? '';
+  flash($('#msgApertura'), '');
+  dlgApertura.showModal();
+}
+dlgApertura.oncancel = e => { if (!dlgApertura.dataset.opcional) e.preventDefault(); };
+// por si el navegador la cierra igual (Escape repetido): se vuelve a abrir hasta que se cargue
+dlgApertura.onclose = () => { if (!dlgApertura.dataset.opcional && !dlgApertura.dataset.listo) dlgApertura.showModal(); };
+$('#aperturaCancelar').onclick = () => dlgApertura.close();
+$('#formApertura').onsubmit = async e => {
+  e.preventDefault();
+  try {
+    await api('POST', '/api/apertura', { fecha: dlgApertura.dataset.fecha, monto: e.target.monto.value });
+    dlgApertura.dataset.listo = '1'; dlgApertura.close();
+    if ($('#informes').classList.contains('on')) verInforme();
+  } catch (err) { flash($('#msgApertura'), err.message, true); }
+};
+async function verificarApertura() {
+  const { monto } = await api('GET', '/api/apertura?fecha=' + hoy());
+  if (monto == null) abrirApertura(hoy());
+}
 
 async function verInforme() {
   const r = rango(), d = await api('GET', `/api/informe?desde=${r.desde}&hasta=${r.hasta}`);
@@ -622,8 +673,13 @@ async function verInforme() {
   // cierre de caja: por medio de pago, lo cobrado menos lo pagado
   const cobrado = m => d.ventas_medio.find(x => x.medio_pago === m)?.total || 0;
   const pagado = m => d.gastos_medio.find(x => x.medio_pago === m)?.total || 0;
-  $('#iCaja').innerHTML = stat('Efectivo en caja', cobrado('efectivo') - pagado('efectivo'),
-      `ventas ${money(cobrado('efectivo'))} − gastos ${money(pagado('efectivo'))}`)
+  const movEfectivo = `ventas ${money(cobrado('efectivo'))} − gastos ${money(pagado('efectivo'))}`;
+  // en el día: apertura + ventas − gastos = lo que tiene que haber en la caja
+  $('#iCaja').innerHTML = (periodo === 'dia'
+    ? stat('Efectivo en caja', (d.apertura || 0) + cobrado('efectivo') - pagado('efectivo'),
+        d.apertura == null ? `sin apertura cargada · ${movEfectivo}` : `apertura ${money(d.apertura)} + ${movEfectivo}`,
+        `<button class="link noprint" data-apertura="${r.desde}" data-monto="${d.apertura ?? ''}">${d.apertura == null ? 'Cargar apertura' : 'Corregir apertura'}</button>`)
+    : stat('Efectivo (entró − salió)', cobrado('efectivo') - pagado('efectivo'), movEfectivo))
     + stat('Transferencias', cobrado('transferencia') - pagado('transferencia'),
       `ventas ${money(cobrado('transferencia'))} − gastos ${money(pagado('transferencia'))}`)
     + (cobrado('') ? stat('Ventas sin medio de pago', cobrado(''), 'cargadas antes de registrar el medio') : '');
@@ -653,7 +709,7 @@ $('#salir').onclick = async () => { await api('POST', '/api/logout'); location.r
 setTipo('minorista');
 api('GET', '/api/sesion').then(s => {
   $('#salir').hidden = !s.login;
-  if (s.ok) cargarProductos(); else { $('#login').hidden = false; $('#pass').focus(); }
+  if (s.ok) { cargarProductos(); verificarApertura(); } else { $('#login').hidden = false; $('#pass').focus(); }
 });
 </script>
 </body>

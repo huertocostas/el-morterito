@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS gastos (
   monto REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_gastos_fecha ON gastos(fecha);
+-- efectivo con el que se abre la caja cada día
+CREATE TABLE IF NOT EXISTS aperturas (
+  fecha TEXT PRIMARY KEY,
+  monto REAL NOT NULL
+);
 `);
   // columnas agregadas después de la primera versión (la base de Turso ya existe)
   for (const sql of ['ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0',
@@ -188,11 +193,29 @@ const routes = {
     return { ok: true };
   },
 
+  'GET /api/apertura': async (_, q) => {
+    const fecha = q.get('fecha') ?? '';
+    check(/^\d{4}-\d{2}-\d{2}$/.test(fecha), 'Fecha inválida');
+    return { monto: (await one('SELECT monto FROM aperturas WHERE fecha = ?', [fecha]))?.monto ?? null };
+  },
+
+  // se puede volver a mandar para corregir el monto del día
+  'POST /api/apertura': async (b) => {
+    check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
+    check(b.monto !== '' && b.monto != null, 'Poné con cuánto efectivo empezás (puede ser 0)');
+    const monto = num(b.monto, 'Monto');
+    await db.execute({ sql: 'INSERT INTO aperturas (fecha, monto) VALUES (?, ?) ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto',
+      args: [b.fecha, monto] });
+    return { ok: true };
+  },
+
   // informe de un período (día, semana o mes): ?desde=AAAA-MM-DD&hasta=AAAA-MM-DD
   'GET /api/informe': async (_, q) => {
     const rango = [q.get('desde') ?? '', q.get('hasta') ?? ''];
     check(rango.every(f => /^\d{4}-\d{2}-\d{2}$/.test(f)), 'Período inválido');
     return {
+      // solo en el informe de un día: la caja se cuenta día por día
+      apertura: rango[0] === rango[1] ? (await one('SELECT monto FROM aperturas WHERE fecha = ?', [rango[0]]))?.monto ?? null : null,
       // ganancia = (precio - costo al momento de la venta) x cantidad
       ventas: await all(`SELECT tipo, COUNT(*) AS lineas, SUM(-cantidad * precio_unitario) AS total,
           SUM(-cantidad * (precio_unitario - costo_unitario)) AS ganancia,

@@ -115,6 +115,18 @@ try {
   assert.equal((await api('GET', '/api/informe?desde=3-11&hasta=2026-11-03')).status, 400);
   assert.equal((await api('GET', '/api/informe?mes=2026-11')).status, 400);
 
+  // apertura de caja: una por día, se puede corregir, admite 0, no negativos ni vacío
+  assert.deepEqual((await api('GET', '/api/apertura?fecha=2026-11-03')).data, { monto: null });
+  assert.equal((await api('POST', '/api/apertura', { fecha: '2026-11-03', monto: '' })).status, 400);
+  assert.equal((await api('POST', '/api/apertura', { fecha: '2026-11-03', monto: -5 })).status, 400);
+  assert.equal((await api('POST', '/api/apertura', { fecha: '2026-11-03', monto: 1000 })).status, 200);
+  assert.equal((await api('POST', '/api/apertura', { fecha: '2026-11-03', monto: '2000' })).status, 200); // corrección
+  assert.deepEqual((await api('GET', '/api/apertura?fecha=2026-11-03')).data, { monto: 2000 });
+  assert.equal((await api('POST', '/api/apertura', { fecha: '2026-11-04', monto: 0 })).status, 200);
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-03&hasta=2026-11-03')).data.apertura, 2000);
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-04&hasta=2026-11-04')).data.apertura, 0);
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-02&hasta=2026-11-08')).data.apertura, null); // semana: no aplica
+
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);
   console.log('OK — todas las pruebas pasaron');
