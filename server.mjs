@@ -69,6 +69,7 @@ const all = async (sql, args = []) => (await db.execute({ sql, args })).rows.map
 const one = async (sql, args) => (await all(sql, args))[0];
 
 class BadRequest extends Error {}
+class Conflict extends BadRequest {} // 409: la pantalla ofrece una alternativa (desactivar)
 const check = (ok, msg) => { if (!ok) throw new BadRequest(msg); };
 const num = (v, campo, min = 0) => {
   const n = Number(v ?? 0);
@@ -136,6 +137,19 @@ const routes = {
   },
 
   // { tipo, fecha, items: [{ producto_id, cantidad, precio_unitario }] }
+  // borra un producto y sus movimientos de stock; si tiene ventas no, para no alterar informes pasados
+  'DELETE /api/productos': async (_, q) => {
+    const id = Number(q.get('id'));
+    const { n } = await one(`SELECT COUNT(*) AS n FROM movimientos WHERE producto_id = ? AND tipo IN ('minorista','mayorista')`, [id]);
+    if (n) throw new Conflict(`No se puede borrar: tiene ${n} venta(s) registrada(s) y los informes de esos días quedarían mal.`);
+    const [, r] = await db.batch([
+      { sql: 'DELETE FROM movimientos WHERE producto_id = ?', args: [id] },
+      { sql: 'DELETE FROM productos WHERE id = ?', args: [id] },
+    ], 'write');
+    check(r.rowsAffected === 1, 'Producto no encontrado');
+    return { ok: true };
+  },
+
   'POST /api/movimientos': async (b) => {
     check(['minorista', 'mayorista', 'compra', 'ajuste'].includes(b.tipo), 'Tipo inválido');
     check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
@@ -280,7 +294,7 @@ export async function handler(req, res) {
     const body = req.method === 'POST' ? await leerBody(req) : {};
     send(200, await route(body, url.searchParams, req, res));
   } catch (e) {
-    if (e instanceof BadRequest) return send(400, { error: e.message });
+    if (e instanceof BadRequest) return send(e instanceof Conflict ? 409 : 400, { error: e.message });
     if (String(e.message).includes('UNIQUE')) return send(400, { error: 'Ya existe un producto con ese nombre' });
     console.error(e);
     // solo lo ven usuarios con sesión (los dueños): el detalle sirve para diagnosticar desde una captura

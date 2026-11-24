@@ -137,6 +137,18 @@ try {
   assert.equal((await api('GET', '/api/informe?desde=2026-11-04&hasta=2026-11-04')).data.apertura, 0);
   assert.equal((await api('GET', '/api/informe?desde=2026-11-02&hasta=2026-11-08')).data.apertura, null); // semana: no aplica
 
+  // borrar productos: sin ventas se borra (con su stock inicial); con ventas no (409); inexistente 400
+  const { data: { id: prueba } } = await api('POST', '/api/productos', { nombre: 'Producto de prueba', precio_minorista: 10 });
+  await api('POST', '/api/movimientos', { tipo: 'ajuste', fecha: '2026-11-03', items: [{ producto_id: prueba, cantidad: 5 }] });
+  assert.equal((await api('DELETE', '/api/productos?id=' + prueba)).status, 200);
+  assert.equal((await api('GET', '/api/productos')).data.some(p => p.id === prueba), false);
+  assert.equal((await api('GET', '/api/movimientos')).data.some(m => m.producto_id === prueba), false);
+  const conVentas = await api('DELETE', '/api/productos?id=' + yerba);
+  assert.equal(conVentas.status, 409);
+  assert.match(conVentas.data.error, /venta/);
+  assert.equal((await api('GET', '/api/productos')).data.some(p => p.id === yerba), true);
+  assert.equal((await api('DELETE', '/api/productos?id=99999')).status, 400);
+
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);
   console.log('OK — todas las pruebas pasaron');
