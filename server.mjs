@@ -12,7 +12,7 @@ const db = createClient({
   authToken: process.env.TURSO_AUTH_TOKEN,
 });
 
-const listo = (async () => { await db.executeMultiple(`
+async function iniciar() { await db.executeMultiple(`
 CREATE TABLE IF NOT EXISTS productos (
   id INTEGER PRIMARY KEY,
   nombre TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -59,8 +59,11 @@ CREATE TABLE IF NOT EXISTS aperturas (
     "ALTER TABLE gastos ADD COLUMN medio_pago TEXT NOT NULL DEFAULT 'efectivo'"]) {
     try { await db.execute(sql); } catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
   }
-})();
-listo.catch(() => {}); // el error se informa en cada pedido (await listo), no tira abajo el proceso
+}
+// Se prepara la base una vez por servidor. Si falla (p. ej. Turso no responde un momento), se olvida
+// el fallo y el próximo pedido vuelve a intentar: antes quedaba trabado en "Error interno" hasta reiniciarse.
+let listo = null;
+const preparar = () => (listo ??= iniciar().catch(e => { listo = null; throw e; }));
 
 const all = async (sql, args = []) => (await db.execute({ sql, args })).rows.map(r => ({ ...r }));
 const one = async (sql, args) => (await all(sql, args))[0];
@@ -239,6 +242,7 @@ const routes = {
   },
 };
 const PUBLICAS = ['GET /api/sesion', 'POST /api/login'];
+const SIN_BASE = [...PUBLICAS, 'POST /api/logout']; // funcionan aunque la base no responda
 
 async function leerBody(req) {
   let raw = req.body; // en Vercel ya viene leído
@@ -272,14 +276,15 @@ export async function handler(req, res) {
   if (process.env.VERCEL && !PASSWORD) return send(503, { error: 'Falta configurar APP_PASSWORD en Vercel' });
   if (!PUBLICAS.includes(key) && !autenticado(req)) return send(401, { error: 'Iniciá sesión' });
   try {
-    await listo;
+    if (!SIN_BASE.includes(key)) await preparar();
     const body = req.method === 'POST' ? await leerBody(req) : {};
     send(200, await route(body, url.searchParams, req, res));
   } catch (e) {
     if (e instanceof BadRequest) return send(400, { error: e.message });
     if (String(e.message).includes('UNIQUE')) return send(400, { error: 'Ya existe un producto con ese nombre' });
     console.error(e);
-    send(500, { error: 'Error interno' });
+    // solo lo ven usuarios con sesión (los dueños): el detalle sirve para diagnosticar desde una captura
+    send(500, { error: `No se pudo completar, probá de nuevo en unos segundos. (Detalle: ${e.message})` });
   }
 }
 

@@ -709,7 +709,11 @@ $('#salir').onclick = async () => { await api('POST', '/api/logout'); location.r
 setTipo('minorista');
 api('GET', '/api/sesion').then(s => {
   $('#salir').hidden = !s.login;
-  if (s.ok) { cargarProductos(); verificarApertura(); } else { $('#login').hidden = false; $('#pass').focus(); }
+  if (s.ok) {
+    // si falla, avisar en vez de mostrar la lista vacía como si no hubiera productos
+    cargarProductos().catch(err => alert('No se pudieron cargar los productos. Recargá la página.\n\n' + err.message));
+    verificarApertura().catch(() => {});
+  } else { $('#login').hidden = false; $('#pass').focus(); }
 });
 </script>
 </body>

@@ -19,6 +19,9 @@ CREATE TABLE movimientos (id INTEGER PRIMARY KEY, fecha TEXT NOT NULL, tipo TEXT
 CREATE VIEW stock AS SELECT p.*, COALESCE(SUM(m.cantidad), 0) AS stock FROM productos p LEFT JOIN movimientos m ON m.producto_id = p.id GROUP BY p.id;
 INSERT INTO productos (nombre) VALUES ('Viejo');`);
 vieja.close();
+// simula una falla pasajera de la base: otra conexión la tiene trabada mientras el servidor arranca
+const traba = createClient({ url: pathToFileURL(DB).href });
+const trabaTx = await traba.transaction('write');
 const srv = spawn(process.execPath, [join(import.meta.dirname, 'server.mjs')],
   { env: { ...process.env, MORTERITO_DB: DB, PORT, APP_PASSWORD: 'clave-test', TURSO_DATABASE_URL: '' } });
 srv.stderr.pipe(process.stderr);
@@ -37,6 +40,13 @@ try {
   assert.equal((await api('POST', '/api/login', { password: 'otra' })).status, 400);
   assert.equal((await api('GET', '/api/productos')).status, 401);
   assert.equal((await api('POST', '/api/login', { password: 'clave-test' })).status, 200);
+
+  // falla pasajera: con la base trabada, preparar la base falla y se avisa con el detalle...
+  const fallo = await api('GET', '/api/productos');
+  assert.equal(fallo.status, 500);
+  assert.match(fallo.data.error, /probá de nuevo.*Detalle/);
+  // ...y apenas se libera, el siguiente pedido funciona (antes quedaba en "Error interno" hasta reiniciar)
+  await trabaTx.rollback(); trabaTx.close(); traba.close();
   assert.equal((await api('GET', '/api/productos')).status, 200);
 
   // la base vieja se migró: el producto que ya existía tiene costo 0
@@ -133,5 +143,5 @@ try {
 } finally {
   srv.kill();
   await new Promise(r => srv.once('exit', r));
-  rmSync(DB, { force: true });
+  try { rmSync(DB, { force: true }); } catch {} // que la limpieza no tape el error real de la prueba
 }

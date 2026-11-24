@@ -16,3 +16,6 @@ node_modules/
 *.png
 !public/logo.jpg
 !public/logo-chico.jpg
+*.mp4
+*.mov
+*.3gp
