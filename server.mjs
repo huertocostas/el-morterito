@@ -73,9 +73,11 @@ class Conflict extends BadRequest {} // 409: la pantalla ofrece una alternativa 
 const check = (ok, msg) => { if (!ok) throw new BadRequest(msg); };
 const num = (v, campo, min = 0) => {
   const n = Number(v ?? 0);
-  check(Number.isFinite(n) && n >= min, `${campo} inválido`);
+  check(Number.isFinite(n) && n >= min, `${campo}: valor inválido`);
   return n;
 };
+// id de ?id=…; uno inválido (texto, vacío) es un 400 claro y no un error de la base
+const idDe = q => { const id = Number(q.get('id')); check(Number.isInteger(id) && id > 0, 'Identificador inválido'); return id; };
 const VENTAS = ['minorista', 'mayorista'];
 const MEDIOS = ['efectivo', 'transferencia'];
 
@@ -136,10 +138,9 @@ const routes = {
     return { id: Number(r.lastInsertRowid) };
   },
 
-  // { tipo, fecha, items: [{ producto_id, cantidad, precio_unitario }] }
   // borra un producto y sus movimientos de stock; si tiene ventas no, para no alterar informes pasados
   'DELETE /api/productos': async (_, q) => {
-    const id = Number(q.get('id'));
+    const id = idDe(q);
     const { n } = await one(`SELECT COUNT(*) AS n FROM movimientos WHERE producto_id = ? AND tipo IN ('minorista','mayorista')`, [id]);
     if (n) throw new Conflict(`No se puede borrar: tiene ${n} venta(s) registrada(s) y los informes de esos días quedarían mal.`);
     const [, r] = await db.batch([
@@ -150,10 +151,12 @@ const routes = {
     return { ok: true };
   },
 
+  // { tipo, fecha, medio_pago, items: [{ producto_id, cantidad, precio_unitario }] }
   'POST /api/movimientos': async (b) => {
     check(['minorista', 'mayorista', 'compra', 'ajuste'].includes(b.tipo), 'Tipo inválido');
     check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
     check(Array.isArray(b.items) && b.items.length, 'No hay productos cargados');
+    check(b.items.every(it => it && typeof it === 'object'), 'Producto inexistente');
     const venta = VENTAS.includes(b.tipo);
     check(!venta || MEDIOS.includes(b.medio_pago), 'Elegí el medio de pago');
     const ids = [...new Set(b.items.map(it => Number(it.producto_id)))];
@@ -183,7 +186,7 @@ const routes = {
     [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99']),
 
   'DELETE /api/movimientos': async (_, q) => {
-    const r = await db.execute({ sql: 'DELETE FROM movimientos WHERE id = ?', args: [Number(q.get('id'))] });
+    const r = await db.execute({ sql: 'DELETE FROM movimientos WHERE id = ?', args: [idDe(q)] });
     check(r.rowsAffected === 1, 'Movimiento no encontrado');
     return { ok: true };
   },
@@ -205,7 +208,7 @@ const routes = {
   },
 
   'DELETE /api/gastos': async (_, q) => {
-    const r = await db.execute({ sql: 'DELETE FROM gastos WHERE id = ?', args: [Number(q.get('id'))] });
+    const r = await db.execute({ sql: 'DELETE FROM gastos WHERE id = ?', args: [idDe(q)] });
     check(r.rowsAffected === 1, 'Gasto no encontrado');
     return { ok: true };
   },
@@ -259,7 +262,8 @@ const PUBLICAS = ['GET /api/sesion', 'POST /api/login'];
 const SIN_BASE = [...PUBLICAS, 'POST /api/logout']; // funcionan aunque la base no responda
 
 async function leerBody(req) {
-  let raw = req.body; // en Vercel ya viene leído
+  let raw;
+  try { raw = req.body; } catch { throw new BadRequest('JSON inválido'); } // en Vercel ya viene leído (y tira si no es JSON)
   if (raw === undefined) {
     raw = '';
     for await (const chunk of req) { raw += chunk; if (raw.length > 1e6) throw new BadRequest('Pedido demasiado grande'); }

@@ -354,7 +354,13 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = n => new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(n || 0);
 const qty = n => new Intl.NumberFormat('es-AR', { maximumFractionDigits: 3 }).format(n || 0);
+// "10 unidades", "1 unidad", "2,5 kg" (ya escapado)
+const PLURAL = { unidad: 'unidades', paquete: 'paquetes', litro: 'litros' };
+const cuanto = (n, u) => `${qty(n)} ${esc(Math.abs(n) === 1 ? u : PLURAL[u] ?? u)}`;
 const hoy = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD en hora local
+// para buscar sin importar tildes ni mayúsculas: "mani" encuentra "Maní"
+const norm = s => String(s ?? '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
+const coincide = (p, f) => !f || norm(p.nombre).includes(f) || norm(p.categoria).includes(f);
 const TIPOS = { minorista: 'Venta minorista', mayorista: 'Venta mayorista', compra: 'Compra', ajuste: 'Ajuste' };
 const AYUDA = {
   minorista: 'Tocá un producto o escribí y apretá Enter. Cantidad y precio se pueden cambiar en el ticket.',
@@ -364,19 +370,23 @@ const AYUDA = {
 };
 
 async function api(method, path, body) {
-  const r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body && JSON.stringify(body) });
-  if (r.status === 401) { $('#login').hidden = false; $('#pass').focus(); throw new Error('Iniciá sesión'); }
+  let r;
+  try { r = await fetch(path, { method, headers: { 'Content-Type': 'application/json' }, body: body && JSON.stringify(body) }); }
+  catch { throw new Error('Sin conexión a internet. Revisá la conexión y probá de nuevo.'); }
+  if (r.status === 401) { $('#login').hidden = false; $('#pass').focus(); throw Object.assign(new Error('Iniciá sesión'), { status: 401 }); }
   const d = await r.json().catch(() => ({ error: 'Error de conexión' }));
   if (!r.ok) throw Object.assign(new Error(d.error || 'Error'), { status: r.status });
   return d;
 }
 function flash(el, text, bad) { el.textContent = text; el.className = 'msg ' + (bad ? 'bad' : 'muted'); }
+// para cargas de secciones: que un error se vea (sin sesión ya se muestra el login)
+const avisar = err => { if (err.status !== 401) alert(err.message); };
 
 // ---------- pestañas ----------
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button, main > section').forEach(x => x.classList.remove('on'));
   b.classList.add('on'); $('#' + b.dataset.tab).classList.add('on');
-  ({ movimientos: verMovimientos, gastos: verGastos, informes: verInforme })[b.dataset.tab]?.();
+  ({ movimientos: verMovimientos, gastos: verGastos, informes: verInforme })[b.dataset.tab]?.().catch(avisar);
 });
 
 // ---------- productos ----------
@@ -389,12 +399,12 @@ async function cargarProductos() {
   pintarProductos();
 }
 function pintarProductos() {
-  const f = $('#buscar').value.trim().toLowerCase();
+  const f = norm($('#buscar').value.trim());
   $('#tablaProd').innerHTML = productos
-    .filter(p => !f || p.nombre.toLowerCase().includes(f) || p.categoria.toLowerCase().includes(f))
+    .filter(p => coincide(p, f))
     .map(p => `<tr class="click ${p.activo && p.stock <= p.stock_minimo ? 'bajo' : ''}" data-id="${p.id}">
       <td>${esc(p.nombre)}${p.activo ? '' : ' <span class="muted">(inactivo)</span>'}</td><td>${esc(p.categoria)}</td>
-      <td class="n">${qty(p.stock)} ${esc(p.unidad)}</td><td class="n">${qty(p.stock_minimo)}</td>
+      <td class="n">${cuanto(p.stock, p.unidad)}</td><td class="n">${qty(p.stock_minimo)}</td>
       <td class="n">${p.costo ? money(p.costo) : '<span class="muted">—</span>'}</td>
       <td class="n">${money(p.precio_minorista)}</td><td class="n">${money(p.precio_mayorista)}</td>
       <td class="n">${margen(p)}</td></tr>`).join('')
@@ -486,9 +496,8 @@ document.querySelectorAll('#tipos button').forEach(b => b.onclick = () => { setT
 
 let categoria = ''; // '' = todas
 function filtrados() {
-  const f = $('#q').value.trim().toLowerCase();
-  return productos.filter(p => p.activo && (!categoria || p.categoria === categoria)
-    && (!f || p.nombre.toLowerCase().includes(f) || p.categoria.toLowerCase().includes(f)));
+  const f = norm($('#q').value.trim());
+  return productos.filter(p => p.activo && (!categoria || p.categoria === categoria) && coincide(p, f));
 }
 function pintarTiles() {
   const cats = [...new Set(productos.filter(p => p.activo).map(p => p.categoria).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'es'));
@@ -499,7 +508,7 @@ function pintarTiles() {
   $('#tiles').classList.toggle('filtrando', !!$('#q').value.trim());
   $('#tiles').innerHTML = lista.map(p => `<button class="tile" data-id="${p.id}">
       <span class="t-nombre">${esc(p.nombre)}</span>
-      <span class="t-meta ${p.stock <= p.stock_minimo ? 'bad' : ''}">${qty(p.stock)} ${esc(p.unidad)} en stock</span>
+      <span class="t-meta ${p.stock <= p.stock_minimo ? 'bad' : ''}">${cuanto(p.stock, p.unidad)} en stock</span>
       <span class="t-precio">${esVenta() ? money(precioDe(p)) : ''}</span></button>`).join('')
     || `<p class="muted">${productos.length ? 'Ningún producto coincide con la búsqueda.' : 'Todavía no hay productos: crealos en "Productos".'}</p>`;
 }
@@ -541,7 +550,7 @@ function actualizarTotales() {
   lineas.forEach((l, i) => {
     if ($('#sub' + i)) $('#sub' + i).textContent = money(l.cantidad * l.precio);
     // aviso si la venta deja el stock negativo (se permite igual: el stock cargado puede estar mal)
-    $('#warn' + i).textContent = esVenta() && l.cantidad > l.p.stock ? `Ojo: hay ${qty(l.p.stock)} ${l.p.unidad} en stock` : '';
+    $('#warn' + i).textContent = esVenta() && l.cantidad > l.p.stock ? `Ojo: hay ${cuanto(l.p.stock, l.p.unidad)} en stock` : '';
   });
   $('#totalWrap').hidden = $('#pago').hidden = !esVenta();
   $('#total').textContent = money(totalTicket());
@@ -569,6 +578,7 @@ $('#lineas').oninput = e => {
 $('#limpiar').onclick = () => { lineas = []; pintarLineas(); flash($('#msgCargar'), ''); enfocarBusqueda(); };
 $('#guardar').onclick = async () => {
   if (lineas.some(l => !l.cantidad)) return flash($('#msgCargar'), 'Hay un producto con cantidad 0.', true);
+  revisarDia(); // que una venta hecha pasada la medianoche no quede con la fecha de ayer
   const btn = $('#guardar'), total = totalTicket(); btn.disabled = true;
   try {
     await api('POST', '/api/movimientos', { tipo, fecha: $('#fecha').value, medio_pago: medio, items: lineas.map(l => ({ producto_id: l.p.id, cantidad: l.cantidad, precio_unitario: l.precio })) });
@@ -585,12 +595,12 @@ async function verMovimientos() {
   $('#tablaMov').innerHTML = rows.map(m => {
     const venta = m.tipo === 'minorista' || m.tipo === 'mayorista', c = venta ? -m.cantidad : m.cantidad;
     return `<tr><td>${m.fecha.split('-').reverse().join('/')}</td><td>${TIPOS[m.tipo]}${MEDIO[m.medio_pago] ? ` <span class="muted">· ${MEDIO[m.medio_pago]}</span>` : ''}</td><td>${esc(m.nombre)}</td>
-      <td class="n">${qty(c)} ${esc(m.unidad)}</td><td class="n">${venta ? money(m.precio_unitario) : ''}</td>
+      <td class="n">${cuanto(c, m.unidad)}</td><td class="n">${venta ? money(m.precio_unitario) : ''}</td>
       <td class="n">${venta ? money(c * m.precio_unitario) : ''}</td>
       <td class="n"><button class="link" data-id="${m.id}">Borrar</button></td></tr>`;
   }).join('') || '<tr><td colspan="7" class="muted">Sin movimientos en esas fechas.</td></tr>';
 }
-$('#mVer').onclick = verMovimientos;
+$('#mVer').onclick = () => verMovimientos().catch(avisar);
 $('#tablaMov').onclick = async e => {
   const id = e.target.dataset.id;
   if (!id || !confirm('¿Borrar este movimiento? El stock se recalcula solo.')) return;
@@ -608,7 +618,7 @@ async function verGastos() {
       <td class="n"><button class="link" data-id="${g.id}">Borrar</button></td></tr>`).join('')
     || '<tr><td colspan="6" class="muted">Sin gastos en el mes.</td></tr>';
 }
-$('#gMes').onchange = verGastos;
+$('#gMes').onchange = () => verGastos().catch(avisar);
 $('#formGasto').onsubmit = async e => {
   e.preventDefault();
   const f = e.target, data = Object.fromEntries(new FormData(f));
@@ -631,6 +641,7 @@ const iso = d => d.toLocaleDateString('en-CA');
 const fechaLarga = (d, opc) => d.toLocaleDateString('es-AR', opc);
 // rango del período que contiene la fecha elegida; la semana va de lunes a domingo
 function rango() {
+  if (!$('#iFecha').value) $('#iFecha').value = hoy(); // si borran la fecha, se usa hoy
   const [y, m, dd] = $('#iFecha').value.split('-').map(Number), d = new Date(y, m - 1, dd);
   if (periodo === 'dia') return { desde: iso(d), hasta: iso(d), titulo: 'Informe del ' + fechaLarga(d, { weekday: 'long', day: 'numeric', month: 'long' }) };
   if (periodo === 'mes') return { desde: iso(new Date(y, m - 1, 1)), hasta: iso(new Date(y, m, 0)), titulo: 'Informe de ' + fechaLarga(d, { month: 'long', year: 'numeric' }) };
@@ -641,9 +652,9 @@ const stat = (t, n, sub = '', extra = '') => `<div class="stat"><span class="mut
 document.querySelectorAll('#iPeriodo button').forEach(b => b.onclick = () => {
   periodo = b.dataset.p;
   document.querySelectorAll('#iPeriodo button').forEach(x => x.classList.toggle('on', x === b));
-  verInforme();
+  verInforme().catch(avisar);
 });
-$('#iFecha').onchange = verInforme;
+$('#iFecha').onchange = () => verInforme().catch(avisar);
 $('#iCaja').onclick = e => {
   const b = e.target.closest('[data-apertura]');
   if (b) abrirApertura(b.dataset.apertura, b.dataset.monto === '' ? null : Number(b.dataset.monto), true);
@@ -671,13 +682,28 @@ $('#formApertura').onsubmit = async e => {
   try {
     await api('POST', '/api/apertura', { fecha: dlgApertura.dataset.fecha, monto: e.target.monto.value });
     dlgApertura.dataset.listo = '1'; dlgApertura.close();
-    if ($('#informes').classList.contains('on')) verInforme();
+    if ($('#informes').classList.contains('on')) verInforme().catch(avisar);
   } catch (err) { flash($('#msgApertura'), err.message, true); }
 };
 async function verificarApertura() {
   const { monto } = await api('GET', '/api/apertura?fecha=' + hoy());
-  if (monto == null) abrirApertura(hoy());
+  if (monto == null && !dlgApertura.open) abrirApertura(hoy());
 }
+
+// La app puede quedar abierta de un día para otro (la notebook del local): si cambió el día, las fechas
+// que estaban en "hoy" pasan al día nuevo (si no, las ventas se guardarían con la fecha de ayer) y se pide la apertura.
+let diaAbierto = hoy();
+function revisarDia() {
+  const d = hoy();
+  if (d === diaAbierto) return;
+  for (const el of [$('#fecha'), $('#mHasta'), $('#formGasto').fecha, $('#iFecha')]) if (el.value === diaAbierto) el.value = d;
+  if ($('#gMes').value === diaAbierto.slice(0, 7)) $('#gMes').value = d.slice(0, 7);
+  if ($('#mDesde').value === diaAbierto.slice(0, 8) + '01') $('#mDesde').value = d.slice(0, 8) + '01';
+  diaAbierto = d;
+  if ($('#login').hidden) verificarApertura().catch(() => {});
+}
+document.addEventListener('visibilitychange', () => { if (!document.hidden) revisarDia(); });
+setInterval(revisarDia, 60 * 1000);
 
 async function verInforme() {
   const r = rango(), d = await api('GET', `/api/informe?desde=${r.desde}&hasta=${r.hasta}`);
@@ -705,9 +731,9 @@ async function verInforme() {
   $('#iAviso').textContent = sinCosto ? `Ojo: ${sinCosto} venta(s) de productos sin costo cargado cuentan como ganancia completa.` : '';
   $('#iGastos').innerHTML = d.gastos.map(g => `<tr><td>${esc(g.categoria)}</td><td class="n">${money(g.total)}</td></tr>`).join('')
     || '<tr><td colspan="2" class="muted">Sin gastos en el período.</td></tr>';
-  $('#iFaltan').innerHTML = d.faltantes.map(f => `<tr><td>${esc(f.nombre)}</td><td class="n bad">${qty(f.stock)} ${esc(f.unidad)}</td><td class="n">${qty(f.stock_minimo)}</td></tr>`).join('')
+  $('#iFaltan').innerHTML = d.faltantes.map(f => `<tr><td>${esc(f.nombre)}</td><td class="n bad">${cuanto(f.stock, f.unidad)}</td><td class="n">${qty(f.stock_minimo)}</td></tr>`).join('')
     || '<tr><td colspan="3" class="muted">No hay faltantes.</td></tr>';
-  $('#iTop').innerHTML = d.mas_vendidos.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.nombre)}</td><td class="n">${qty(r.cantidad)} ${esc(r.unidad)}</td><td class="n">${money(r.total)}</td><td class="n">${money(r.ganancia)}</td></tr>`).join('')
+  $('#iTop').innerHTML = d.mas_vendidos.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.nombre)}</td><td class="n">${cuanto(r.cantidad, r.unidad)}</td><td class="n">${money(r.total)}</td><td class="n">${money(r.ganancia)}</td></tr>`).join('')
     || '<tr><td colspan="5" class="muted">Sin ventas en el período.</td></tr>';
 }
 

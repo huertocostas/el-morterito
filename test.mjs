@@ -149,6 +149,17 @@ try {
   assert.equal((await api('GET', '/api/productos')).data.some(p => p.id === yerba), true);
   assert.equal((await api('DELETE', '/api/productos?id=99999')).status, 400);
 
+  // datos mal formados: siempre un 400 con mensaje, nunca un 500
+  for (const ruta of ['productos', 'movimientos', 'gastos'])
+    for (const id of ['abc', '', '-1', '1.5']) assert.equal((await api('DELETE', `/api/${ruta}?id=${id}`)).status, 400, `${ruta} id=${id}`);
+  assert.equal((await api('POST', '/api/movimientos', { tipo: 'compra', fecha: '2026-11-03', items: [null] })).status, 400);
+  assert.equal((await api('POST', '/api/movimientos', { tipo: 'compra', fecha: '2026-11-03', items: 'x' })).status, 400);
+  const neg = await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-03', items: [{ producto_id: yerba, cantidad: -1 }] });
+  assert.deepEqual([neg.status, neg.data.error], [400, 'Cantidad: valor inválido']);
+  const roto = await fetch(`http://127.0.0.1:${PORT}/api/gastos`, { method: 'POST', body: '{roto', headers: { cookie } });
+  assert.deepEqual([roto.status, (await roto.json()).error], [400, 'JSON inválido']);
+  assert.equal((await api('GET', '/api/nada')).status, 404);
+
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);
   console.log('OK — todas las pruebas pasaron');
