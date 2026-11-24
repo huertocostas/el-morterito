@@ -6,15 +6,39 @@
 <title>El Morterito</title>
 <link rel="icon" href="/logo-chico.jpg">
 <link rel="apple-touch-icon" href="/logo-chico.jpg">
+<script>
+  // antes de pintar, para que no parpadee en claro: el tema elegido queda guardado en este dispositivo
+  try { const t = localStorage.getItem('tema'); if (t === 'dark' || t === 'light') document.documentElement.dataset.theme = t; } catch {}
+</script>
 <style>
   :root {
+    color-scheme: light;
     --bg: #f6f3ec; --card: #fffdf8; --ink: #2b2a25; --muted: #77736a; --line: #e2ddd0;
     --accent: #4f6b3a; --accent-ink: #fff; --warn: #a8442a; --warn-bg: #f8e6df;
+    --header: #4f6b3a; --header-ink: #fff; --field: #fff; --seg: #ebe6da; --hover: #f1ede2;
+    --shadow: rgba(0,0,0,.12); --backdrop: rgba(30,28,20,.45); --skel: #e9e4d7; --skel-brillo: #f6f2ea;
+  }
+  /* modo oscuro: sigue al sistema salvo que se elija claro con el botón; o se fuerza con data-theme="dark" */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: #171914; --card: #21241d; --ink: #e8e5da; --muted: #a29e91; --line: #383c32;
+      --accent: #92b872; --accent-ink: #13170e; --warn: #ee9273; --warn-bg: #3b2520;
+      --header: #2c3f22; --header-ink: #eef0e6; --field: #1b1e18; --seg: #2b2f26; --hover: #2a2e25;
+      --shadow: rgba(0,0,0,.5); --backdrop: rgba(0,0,0,.6); --skel: #2c3027; --skel-brillo: #3b4034;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #171914; --card: #21241d; --ink: #e8e5da; --muted: #a29e91; --line: #383c32;
+    --accent: #92b872; --accent-ink: #13170e; --warn: #ee9273; --warn-bg: #3b2520;
+    --header: #2c3f22; --header-ink: #eef0e6; --field: #1b1e18; --seg: #2b2f26; --hover: #2a2e25;
+    --shadow: rgba(0,0,0,.5); --backdrop: rgba(0,0,0,.6); --skel: #2c3027; --skel-brillo: #3b4034;
   }
   * { box-sizing: border-box; }
   [hidden] { display: none !important; } /* si no, label {display:flex} le gana al atributo hidden */
   body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
-  header { background: var(--accent); color: var(--accent-ink); padding: 12px 20px; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+  header { background: var(--header); color: var(--header-ink); padding: 12px 20px; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
   header h1 { margin: 0; font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
   .logo { width: 42px; height: 42px; border-radius: 8px; background: #fff; }
   nav { display: flex; gap: 4px; flex-wrap: wrap; }
@@ -28,16 +52,16 @@
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
   label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
   label.check { flex-direction: row; align-items: center; color: var(--ink); }
-  input, select { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); min-width: 0; }
+  input, select { font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--field); color: var(--ink); min-width: 0; }
   input:focus, select:focus, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  button { font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--line); background: #fff; color: var(--ink); cursor: pointer; }
+  button { font: inherit; padding: 8px 16px; border-radius: 6px; border: 1px solid var(--line); background: var(--field); color: var(--ink); cursor: pointer; }
   button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   button.link { border: 0; background: none; color: var(--warn); padding: 4px 8px; }
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
   th { font-size: 12px; color: var(--muted); font-weight: 500; }
   td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
-  tr.click { cursor: pointer; } tr.click:hover { background: #f1ede2; }
+  tr.click { cursor: pointer; } tr.click:hover { background: var(--hover); }
   tr.bajo td { background: var(--warn-bg); }
   .muted { color: var(--muted); font-size: 13px; }
   .bad { color: var(--warn); }
@@ -47,9 +71,9 @@
   /* ---- pantalla de venta ---- */
   .pos { display: grid; grid-template-columns: 1fr 390px; gap: 16px; align-items: start; }
   .pos > * { min-width: 0; } /* sin esto, filas que no se parten (categorías) ensanchan la página */
-  .seg { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 3px; margin-bottom: 12px; background: #ebe6da; border-radius: 8px; }
+  .seg { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 3px; margin-bottom: 12px; background: var(--seg); border-radius: 8px; }
   .seg button { border: 0; background: transparent; padding: 7px 16px; border-radius: 6px; color: var(--muted); }
-  .seg button.on { background: var(--card); color: var(--ink); font-weight: 500; box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+  .seg button.on { background: var(--card); color: var(--ink); font-weight: 500; box-shadow: 0 1px 2px var(--shadow); }
   .search { width: 100%; font-size: 17px; padding: 12px 14px; border-radius: 8px; }
   .hint { margin: 8px 0 12px; min-height: 1.2em; }
   .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
@@ -80,7 +104,7 @@
   .x:hover { color: var(--warn); }
   .l-bot { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
   .qty { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
-  .qty button { border: 0; border-radius: 0; padding: 4px 11px; background: #f3efe5; font-size: 16px; }
+  .qty button { border: 0; border-radius: 0; padding: 4px 11px; background: var(--seg); font-size: 16px; }
   .qty input { width: 58px; border: 0; border-radius: 0; padding: 4px; text-align: center; }
   label.precio { flex-direction: row; align-items: center; gap: 3px; font-size: 13px; white-space: nowrap; }
   label.precio input { width: 76px; padding: 4px 6px; }
@@ -116,7 +140,7 @@
     .t-nombre { font-size: 14px; }
     /* ticket = barra fija abajo; se despliega como hoja al tocar "Ver ticket" */
     .ticket { position: fixed; left: 0; right: 0; bottom: 0; top: auto; z-index: 5; max-height: 80vh;
-      border-radius: 14px 14px 0 0; border-bottom: 0; box-shadow: 0 -4px 16px rgba(0,0,0,.12); }
+      border-radius: 14px 14px 0 0; border-bottom: 0; box-shadow: 0 -4px 16px var(--shadow); }
     .ticket:not(.abierta) .ticket-head, .ticket:not(.abierta) .lineas, .ticket:not(.abierta) #limpiar { display: none; }
     .ticket-foot { grid-template-columns: 1fr auto; align-items: center; padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); border-top: 0; }
     .ticket.abierta .ticket-foot { border-top: 1px solid var(--line); }
@@ -138,15 +162,27 @@
   .login h2 { margin: 0; justify-self: center; }
   .login h2 img { display: block; width: 150px; height: 150px; border-radius: 50%; }
   dialog { border: 0; border-radius: 12px; padding: 20px; width: min(360px, calc(100vw - 32px)); background: var(--card); color: var(--ink); }
-  dialog::backdrop { background: rgba(30, 28, 20, .45); }
+  dialog::backdrop { background: var(--backdrop); }
   dialog form { display: grid; gap: 12px; }
   dialog h2 { margin: 0; }
   dialog input { font-size: 20px; }
   .stat .link { padding: 4px 0 0; font-size: 13px; color: var(--accent); }
-  #salir { margin-left: auto; background: transparent; color: inherit; border-color: rgba(255,255,255,.4); }
+  #salir { background: transparent; color: inherit; border-color: rgba(255,255,255,.4); }
+  #tema { background: transparent; color: inherit; border-color: rgba(255,255,255,.4); padding: 5px 8px; line-height: 0; }
+  #tema svg { width: 18px; height: 18px; }
+  .acciones { margin-left: auto; display: flex; gap: 6px; }
+  /* skeleton de carga: bloque gris con brillo que recorre */
+  .skel { display: block; max-width: 100%; border-radius: 6px; color: transparent;
+    background: linear-gradient(90deg, var(--skel) 25%, var(--skel-brillo) 50%, var(--skel) 75%); background-size: 200% 100%;
+    animation: skel 1.3s linear infinite; }
+  .stat .skel + .skel { margin-top: 10px; }
+  .tile .skel { margin-bottom: 6px; }
+  @keyframes skel { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  @media (prefers-reduced-motion: reduce) { .skel { animation: none; } }
   @media print {
+    /* siempre en claro sobre papel, aunque la pantalla esté en modo oscuro */
+    :root, :root[data-theme] { color-scheme: light; --bg: #fff; --card: #fff; --ink: #000; --muted: #555; --line: #ccc; --warn: #a8442a; }
     header, .noprint { display: none !important; }
-    body { background: #fff; } .card, .stat { border-color: #ccc; }
   }
 </style>
 </head>
@@ -160,7 +196,10 @@
     <button data-tab="gastos">Gastos</button>
     <button data-tab="informes">Informes</button>
   </nav>
-  <button id="salir" hidden>Salir</button>
+  <div class="acciones">
+    <button id="tema" aria-label="Cambiar a modo oscuro" title="Modo claro / oscuro"></button>
+    <button id="salir" hidden>Salir</button>
+  </div>
 </header>
 
 <dialog id="dlgApertura" aria-labelledby="aperturaTitulo">
@@ -382,6 +421,34 @@ function flash(el, text, bad) { el.textContent = text; el.className = 'msg ' + (
 // para cargas de secciones: que un error se vea (sin sesión ya se muestra el login)
 const avisar = err => { if (err.status !== 401) alert(err.message); };
 
+// ---------- tema claro / oscuro ----------
+// el botón muestra el modo al que se pasa: luna en claro, sol en oscuro
+const svg = d => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${d}</svg>`;
+const LUNA = svg('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>');
+const SOL = svg('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>');
+const oscuroSistema = matchMedia('(prefers-color-scheme: dark)');
+const temaActual = () => document.documentElement.dataset.theme || (oscuroSistema.matches ? 'dark' : 'light');
+function pintarTema() {
+  const oscuro = temaActual() === 'dark';
+  $('#tema').innerHTML = oscuro ? SOL : LUNA;
+  $('#tema').setAttribute('aria-label', oscuro ? 'Cambiar a modo claro' : 'Cambiar a modo oscuro');
+}
+$('#tema').onclick = () => {
+  const t = temaActual() === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem('tema', t); } catch {}
+  pintarTema();
+};
+oscuroSistema.addEventListener('change', pintarTema);
+pintarTema();
+
+// ---------- skeletons de carga ----------
+const sk = (w = '100%', h = '14px') => `<span class="skel" style="width:${w};height:${h}"></span>`;
+const repetir = (n, f) => Array.from({ length: n }, f).join('');
+const skelFilas = (tbody, cols, n = 4) => { tbody.innerHTML = repetir(n, () => `<tr>${repetir(cols, (_, i) => `<td>${sk(i ? '70%' : '90%')}</td>`)}</tr>`); };
+const skelStats = (el, n) => { el.innerHTML = repetir(n, () => `<div class="stat">${sk('55%', '12px')}${sk('75%', '22px')}</div>`); };
+const skelTiles = () => { $('#tiles').innerHTML = repetir(8, () => `<div class="tile">${sk('75%', '15px')}${sk('50%', '11px')}${sk('40%', '15px')}</div>`); };
+
 // ---------- pestañas ----------
 document.querySelectorAll('nav button').forEach(b => b.onclick = () => {
   document.querySelectorAll('nav button, main > section').forEach(x => x.classList.remove('on'));
@@ -591,6 +658,7 @@ $('#guardar').onclick = async () => {
 
 // ---------- movimientos ----------
 async function verMovimientos() {
+  skelFilas($('#tablaMov'), 7, 6);
   const rows = await api('GET', `/api/movimientos?desde=${$('#mDesde').value}&hasta=${$('#mHasta').value}`);
   $('#tablaMov').innerHTML = rows.map(m => {
     const venta = m.tipo === 'minorista' || m.tipo === 'mayorista', c = venta ? -m.cantidad : m.cantidad;
@@ -611,6 +679,7 @@ $('#tablaMov').onclick = async e => {
 // ---------- gastos ----------
 async function verGastos() {
   const mes = $('#gMes').value;
+  skelFilas($('#tablaGastos'), 6, 4);
   const rows = await api('GET', `/api/gastos?desde=${mes}-01&hasta=${mes}-31`);
   $('#gTotal').textContent = 'Total del mes: ' + money(rows.reduce((s, g) => s + g.monto, 0));
   $('#tablaGastos').innerHTML = rows.map(g => `<tr><td>${g.fecha.split('-').reverse().join('/')}</td><td>${esc(g.categoria)}</td>
@@ -705,8 +774,14 @@ function revisarDia() {
 document.addEventListener('visibilitychange', () => { if (!document.hidden) revisarDia(); });
 setInterval(revisarDia, 60 * 1000);
 
+let pedidoInforme = 0;
 async function verInforme() {
-  const r = rango(), d = await api('GET', `/api/informe?desde=${r.desde}&hasta=${r.hasta}`);
+  const r = rango(), n = ++pedidoInforme;
+  $('#iTitulo').textContent = r.titulo;
+  skelStats($('#iCaja'), 2); skelStats($('#iStats'), 6);
+  skelFilas($('#iGastos'), 2, 2); skelFilas($('#iFaltan'), 3, 2); skelFilas($('#iTop'), 5, 4);
+  const d = await api('GET', `/api/informe?desde=${r.desde}&hasta=${r.hasta}`);
+  if (n !== pedidoInforme) return; // si cambiaron de período mientras cargaba, no pisar con datos viejos
   const suma = k => d.ventas.reduce((s, x) => s + (x[k] || 0), 0);
   const v = t => d.ventas.find(x => x.tipo === t)?.total || 0;
   const ventas = suma('total'), ganancia = suma('ganancia'), gastos = d.gastos.reduce((s, g) => s + g.total, 0);
@@ -752,6 +827,7 @@ api('GET', '/api/sesion').then(s => {
   $('#salir').hidden = !s.login;
   if (s.ok) {
     // si falla, avisar en vez de mostrar la lista vacía como si no hubiera productos
+    skelTiles(); skelFilas($('#tablaProd'), 8, 5);
     cargarProductos().catch(err => alert('No se pudieron cargar los productos. Recargá la página.\n\n' + err.message));
     verificarApertura().catch(() => {});
   } else { $('#login').hidden = false; $('#pass').focus(); }
