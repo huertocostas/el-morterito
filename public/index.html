@@ -76,6 +76,7 @@
   tr.click { cursor: pointer; } tr.click:hover { background: var(--hover); }
   tr.bajo td { background: var(--warn-bg); }
   tr.caja td { background: var(--hover); font-weight: 500; } /* aperturas y cierres se distinguen en el historial */
+  #tablaMov td:first-child, #tablaGastos td:first-child { white-space: nowrap; } /* fecha y hora en un renglón */
   .muted { color: var(--muted); font-size: 13px; }
   .bad { color: var(--warn); }
   .msg { min-height: 22px; margin-top: 8px; }
@@ -517,6 +518,9 @@ const qty = n => new Intl.NumberFormat('es-AR', { maximumFractionDigits: 3 }).fo
 const PLURAL = { unidad: 'unidades', paquete: 'paquetes', litro: 'litros' };
 const cuanto = (n, u) => `${qty(n)} ${esc(Math.abs(n) === 1 ? u : PLURAL[u] ?? u)}`;
 const hoy = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD en hora local
+// hora local en que se registró algo (el servidor la guarda en UTC); lo viejo no tiene
+const horaDe = iso => iso ? new Date(iso).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: false }) : '';
+const conHora = (f, iso) => `${f.split('-').reverse().join('/')}${iso ? ` <span class="muted">${horaDe(iso)}</span>` : ''}`;
 // para buscar sin importar tildes ni mayúsculas: "mani" encuentra "Maní"
 const norm = s => String(s ?? '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
 const coincide = (p, f) => !f || norm(p.nombre).includes(f) || norm(p.categoria).includes(f);
@@ -834,7 +838,7 @@ $('#guardar').onclick = async () => {
     await api('POST', '/api/movimientos', { tipo, fecha: $('#fecha').value, medio_pago: medio, items: lineas.map(l => ({ producto_id: l.p.id, cantidad: l.cantidad, precio_unitario: l.precio })) });
     const pagado = MEDIO[medio].toLowerCase();
     lineas = []; setMedio('efectivo'); abrirTicket(false); pintarLineas(); await cargarProductos();
-    flash($('#msgCargar'), esVenta() ? `Venta guardada: ${money(total)} en ${pagado}` : 'Guardado correctamente');
+    flash($('#msgCargar'), esVenta() ? `Venta guardada: ${money(total)} en ${pagado}, a las ${horaDe(new Date().toISOString())}` : 'Guardado correctamente');
     $('#msgCargar').classList.add('ok'); enfocarBusqueda();
   } catch (err) { flash($('#msgCargar'), err.message, true); btn.disabled = false; }
 };
@@ -846,29 +850,31 @@ async function verMovimientos() {
   const rango = `desde=${$('#mDesde').value}&hasta=${$('#mHasta').value}`;
   const [rows, caja] = await Promise.all([api('GET', `/api/movimientos?${rango}`), api('GET', `/api/caja?${rango}`)]);
   movs = rows;
-  const fecha = f => f.split('-').reverse().join('/'), por = u => u ? ` <span class="muted">· ${esc(u)}</span>` : '';
+  const por = u => u ? ` <span class="muted">· ${esc(u)}</span>` : '';
   const filaMov = m => {
     const venta = m.tipo === 'minorista' || m.tipo === 'mayorista', c = venta ? -m.cantidad : m.cantidad;
-    return `<tr><td>${fecha(m.fecha)}</td><td>${TIPOS[m.tipo]}${MEDIO[m.medio_pago] ? ` <span class="muted">· ${MEDIO[m.medio_pago]}</span>` : ''}${por(m.usuario)}</td><td>${esc(m.nombre)}</td>
+    return `<tr><td>${conHora(m.fecha, m.creado)}</td><td>${TIPOS[m.tipo]}${MEDIO[m.medio_pago] ? ` <span class="muted">· ${MEDIO[m.medio_pago]}</span>` : ''}${por(m.usuario)}</td><td>${esc(m.nombre)}</td>
       <td class="n">${cuanto(c, m.unidad)}</td><td class="n">${venta ? money(m.precio_unitario) : ''}</td>
       <td class="n">${venta ? money(c * m.precio_unitario) : ''}</td>
       <td class="n"><button class="link" data-id="${m.id}">Borrar</button></td></tr>`;
   };
   // quién abrió y quién cerró la caja (se corrigen desde Informes, no se borran acá)
-  const filaApertura = a => `<tr class="caja"><td>${fecha(a.fecha)}</td><td>Apertura de caja${por(a.usuario)}</td><td>Efectivo inicial</td>
+  const filaApertura = a => `<tr class="caja"><td>${conHora(a.fecha, a.creado)}</td><td>Apertura de caja${por(a.usuario)}</td><td>Efectivo inicial</td>
       <td></td><td></td><td class="n">${money(a.monto)}</td><td></td></tr>`;
   const filaCierre = c => {
     const dif = Math.round((c.contado - c.esperado) * 100) / 100;
-    return `<tr class="caja"><td>${fecha(c.fecha)}</td><td>Cierre de caja${por(c.usuario)}</td>
+    return `<tr class="caja"><td>${conHora(c.fecha, c.creado)}</td><td>Cierre de caja${por(c.usuario)}</td>
       <td>Contado <span class="${dif < 0 ? 'bad' : 'muted'}">(${dif === 0 ? 'justo' : dif > 0 ? `sobraron ${money(dif)}` : `faltaron ${money(-dif)}`})</span></td>
       <td></td><td></td><td class="n">${money(c.contado)}</td><td></td></tr>`;
   };
-  // de lo más nuevo a lo más viejo; en cada día: el cierre arriba, los movimientos y la apertura abajo
-  const dias = [...new Set([...rows.map(m => m.fecha), ...caja.aperturas.map(a => a.fecha), ...caja.cierres.map(c => c.fecha)])].sort().reverse();
-  $('#tablaMov').innerHTML = dias.map(d => caja.cierres.filter(c => c.fecha === d).map(filaCierre).join('')
-      + rows.filter(m => m.fecha === d).map(filaMov).join('')
-      + caja.aperturas.filter(a => a.fecha === d).map(filaApertura).join('')).join('')
-    || '<tr><td colspan="7" class="muted">Sin movimientos en esas fechas.</td></tr>';
+  // de lo más nuevo a lo más viejo, por día y por hora. Lo viejo sin hora: cierre arriba y apertura abajo
+  // (el orden se arma así y el sort es estable, así que lo que empata queda como está)
+  const filas = [
+    ...caja.cierres.map(c => ({ f: c.fecha, k: c.creado ?? '￿', html: filaCierre(c) })),
+    ...rows.map(m => ({ f: m.fecha, k: m.creado ?? '', html: filaMov(m) })),
+    ...caja.aperturas.map(a => ({ f: a.fecha, k: a.creado ?? '', html: filaApertura(a) })),
+  ].sort((a, b) => b.f.localeCompare(a.f) || b.k.localeCompare(a.k));
+  $('#tablaMov').innerHTML = filas.map(x => x.html).join('') || '<tr><td colspan="7" class="muted">Sin movimientos en esas fechas.</td></tr>';
 }
 $('#mVer').onclick = () => verMovimientos().catch(avisar);
 $('#tablaMov').onclick = async e => {
@@ -892,7 +898,7 @@ async function verGastos() {
   const [y, m] = mes.split('-').map(Number);
   const rows = await api('GET', `/api/gastos?desde=${mes}-01&hasta=${iso(new Date(y, m, 0))}`); // último día real del mes
   $('#gTotal').textContent = 'Total del mes: ' + money(rows.reduce((s, g) => s + g.monto, 0));
-  $('#tablaGastos').innerHTML = rows.map(g => `<tr><td>${g.fecha.split('-').reverse().join('/')}</td><td>${esc(g.categoria)}</td>
+  $('#tablaGastos').innerHTML = rows.map(g => `<tr><td>${conHora(g.fecha, g.creado)}</td><td>${esc(g.categoria)}</td>
       <td>${esc(g.concepto)}${g.usuario ? ` <span class="muted">· ${esc(g.usuario)}</span>` : ''}</td><td>${MEDIO[g.medio_pago] ?? ''}</td><td class="n">${money(g.monto)}</td>
       <td class="n"><button class="link" data-id="${g.id}">Borrar</button></td></tr>`).join('')
     || '<tr><td colspan="6" class="muted">Sin gastos en el mes.</td></tr>';
@@ -995,6 +1001,7 @@ $('#formApertura').onsubmit = async e => {
   try {
     await api('POST', '/api/apertura', { fecha: dlgApertura.dataset.fecha, monto: e.target.monto.value, pin: e.target.pin.value });
     dlgApertura.dataset.listo = '1'; dlgApertura.close();
+    toast(`Caja abierta con ${money(e.target.monto.value)} a las ${horaDe(new Date().toISOString())}.`);
     if ($('#informes').classList.contains('on')) verInforme().catch(avisar);
   } catch (err) { flash($('#msgApertura'), err.message, true); e.target.pin.value = ''; }
 };
@@ -1078,7 +1085,8 @@ $('#formContar').onsubmit = async e => {
     const r = await api('POST', '/api/cierre', { fecha: dlgContar.dataset.fecha, contado: e.target.contado.value, pin: e.target.pin.value });
     if (dlgContar.dataset.fecha === hoy()) local.set('avisoCierre', hoy());
     dlgContar.close();
-    toast(r.diferencia === 0 ? 'Caja cerrada: cierra justo.' : `Caja cerrada: ${r.diferencia > 0 ? 'sobran' : 'faltan'} ${money(Math.abs(r.diferencia))}.`, r.diferencia < 0);
+    const a = ` a las ${horaDe(new Date().toISOString())}`;
+    toast(r.diferencia === 0 ? `Caja cerrada${a}: cierra justo.` : `Caja cerrada${a}: ${r.diferencia > 0 ? 'sobran' : 'faltan'} ${money(Math.abs(r.diferencia))}.`, r.diferencia < 0);
     if ($('#informes').classList.contains('on')) verInforme().catch(avisar);
   } catch (err) { flash($('#msgContar'), err.message, true); e.target.pin.value = ''; }
 };
@@ -1182,7 +1190,7 @@ async function verInforme() {
   // en el día: apertura + ventas − gastos = lo que tiene que haber en la caja
   const esperado = (d.apertura || 0) + cobrado('efectivo') - pagado('efectivo'), c = d.cierre;
   const difCierre = c && Math.round((c.contado - c.esperado) * 100) / 100;
-  const textoCierre = c && `<small class="${difCierre < 0 ? 'bad' : ''}">Cerrada${c.usuario ? ` por ${esc(c.usuario)}` : ''}: contaron ${money(c.contado)} · ${
+  const textoCierre = c && `<small class="${difCierre < 0 ? 'bad' : ''}">Cerrada${c.usuario ? ` por ${esc(c.usuario)}` : ''}${c.creado ? ` a las ${horaDe(c.creado)}` : ''}: contaron ${money(c.contado)} · ${
     difCierre === 0 ? 'cerró justo' : difCierre > 0 ? `sobraron ${money(difCierre)}` : `faltaron ${money(-difCierre)}`}${
     Math.abs(c.esperado - esperado) > 0.009 ? ' (hubo movimientos después del cierre)' : ''}</small>`;
   $('#iCaja').innerHTML = (periodo === 'dia'

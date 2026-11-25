@@ -73,7 +73,10 @@ CREATE TABLE IF NOT EXISTS cierres (
     "ALTER TABLE gastos ADD COLUMN medio_pago TEXT NOT NULL DEFAULT 'efectivo'",
     'ALTER TABLE movimientos ADD COLUMN usuario_id INTEGER', // quién lo hizo (null = antes de haber usuarios)
     'ALTER TABLE gastos ADD COLUMN usuario_id INTEGER',
-    'ALTER TABLE aperturas ADD COLUMN usuario_id INTEGER']) {
+    'ALTER TABLE aperturas ADD COLUMN usuario_id INTEGER',
+    // momento en que se registró (ISO, UTC); lo de antes queda sin hora
+    'ALTER TABLE movimientos ADD COLUMN creado TEXT', 'ALTER TABLE gastos ADD COLUMN creado TEXT',
+    'ALTER TABLE aperturas ADD COLUMN creado TEXT', 'ALTER TABLE cierres ADD COLUMN creado TEXT']) {
     try { await db.execute(sql); } catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
   }
 }
@@ -114,6 +117,7 @@ const hash = s => createHash('sha256').update(String(s)).digest();
 const cookieDe = req => /(?:^|;\s*)sesion=([a-f0-9]+)/.exec(req.headers.cookie || '')?.[1];
 const autenticado = req => !PASSWORD || cookieDe(req) === SESION;
 const esperar = ms => new Promise(r => setTimeout(r, ms));
+const ahora = () => new Date().toISOString(); // la hora la pone el servidor, no el reloj de cada dispositivo
 const esHttps = req => req.headers['x-forwarded-proto'] === 'https';
 const cookie = (req, nombre, valor, segundos) =>
   `${nombre}=${valor}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${segundos}${esHttps(req) ? '; Secure' : ''}`;
@@ -283,6 +287,7 @@ const routes = {
     // el costo se guarda en cada venta: si después cambia, la ganancia de meses anteriores no se altera
     const costo = Object.fromEntries(existen.map(p => [p.id, p.costo]));
     // se valida todo antes de escribir; batch = todo o nada
+    const creado = ahora();
     const stmts = b.items.map(it => {
       // En ajustes la cantidad viene con signo (+ sobrante, - faltante); en el resto, positiva.
       const cant = b.tipo === 'ajuste' ? num(it.cantidad, 'Cantidad', -Infinity) : num(it.cantidad, 'Cantidad');
@@ -290,9 +295,9 @@ const routes = {
       const precio = num(it.precio_unitario, 'Precio');
       check(!venta || precio > 0, 'Hay un producto con precio $0: cargale el precio antes de cobrar');
       return {
-        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago, usuario_id) VALUES (?,?,?,?,?,?,?,?)',
+        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago, usuario_id, creado) VALUES (?,?,?,?,?,?,?,?,?)',
         args: [b.fecha, b.tipo, Number(it.producto_id), venta ? -cant : cant, precio,
-          costo[Number(it.producto_id)], venta ? b.medio_pago : '', uid],
+          costo[Number(it.producto_id)], venta ? b.medio_pago : '', uid, creado],
       };
     });
     await db.batch(stmts, 'write');
@@ -315,8 +320,8 @@ const routes = {
     const mov = b.accion === 'entrada' ? cant : b.accion === 'salida' ? -cant : Math.round((cant - p.stock) * 1000) / 1000;
     if (mov === 0) return { ok: true, movimiento: 0 };
     await db.execute({
-      sql: "INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago, usuario_id) VALUES (?,?,?,?,0,?,'',?)",
-      args: [b.fecha, b.accion === 'entrada' ? 'compra' : 'ajuste', id, mov, p.costo, uid],
+      sql: "INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago, usuario_id, creado) VALUES (?,?,?,?,0,?,'',?,?)",
+      args: [b.fecha, b.accion === 'entrada' ? 'compra' : 'ajuste', id, mov, p.costo, uid, ahora()],
     });
     return { ok: true, movimiento: mov };
   },
@@ -325,9 +330,9 @@ const routes = {
   'GET /api/caja': async (_, q) => {
     const r = [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99'];
     return {
-      aperturas: await all(`SELECT a.fecha, a.monto, u.nombre AS usuario FROM aperturas a
+      aperturas: await all(`SELECT a.fecha, a.monto, a.creado, u.nombre AS usuario FROM aperturas a
         LEFT JOIN usuarios u ON u.id = a.usuario_id WHERE a.fecha BETWEEN ? AND ? ORDER BY a.fecha DESC`, r),
-      cierres: await all(`SELECT c.fecha, c.contado, c.esperado, u.nombre AS usuario FROM cierres c
+      cierres: await all(`SELECT c.fecha, c.contado, c.esperado, c.creado, u.nombre AS usuario FROM cierres c
         LEFT JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha BETWEEN ? AND ? ORDER BY c.fecha DESC`, r),
     };
   },
@@ -356,8 +361,8 @@ const routes = {
     check(monto > 0, 'El monto tiene que ser mayor a 0');
     check(MEDIOS.includes(b.medio_pago), 'Elegí con qué se pagó');
     const uid = await quien(req);
-    const r = await db.execute({ sql: 'INSERT INTO gastos (fecha, categoria, concepto, monto, medio_pago, usuario_id) VALUES (?,?,?,?,?,?)',
-      args: [b.fecha, categoria, String(b.concepto ?? '').trim(), monto, b.medio_pago, uid] });
+    const r = await db.execute({ sql: 'INSERT INTO gastos (fecha, categoria, concepto, monto, medio_pago, usuario_id, creado) VALUES (?,?,?,?,?,?,?)',
+      args: [b.fecha, categoria, String(b.concepto ?? '').trim(), monto, b.medio_pago, uid, ahora()] });
     return { id: Number(r.lastInsertRowid) };
   },
 
@@ -379,8 +384,9 @@ const routes = {
     check(b.monto !== '' && b.monto != null, 'Poné con cuánto efectivo empezás (puede ser 0)');
     const monto = num(b.monto, 'Monto');
     const uid = await confirmarConPin(b);
-    await db.execute({ sql: 'INSERT INTO aperturas (fecha, monto, usuario_id) VALUES (?, ?, ?) ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto, usuario_id = excluded.usuario_id',
-      args: [b.fecha, monto, uid] });
+    await db.execute({ sql: `INSERT INTO aperturas (fecha, monto, usuario_id, creado) VALUES (?, ?, ?, ?)
+        ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto, usuario_id = excluded.usuario_id, creado = excluded.creado`,
+      args: [b.fecha, monto, uid, ahora()] });
     return { ok: true };
   },
 
@@ -392,9 +398,9 @@ const routes = {
     const uid = await confirmarConPin(b);
     const esperado = await efectivoEsperado(b.fecha);
     await db.execute({
-      sql: `INSERT INTO cierres (fecha, contado, esperado, usuario_id) VALUES (?, ?, ?, ?)
-        ON CONFLICT(fecha) DO UPDATE SET contado = excluded.contado, esperado = excluded.esperado, usuario_id = excluded.usuario_id`,
-      args: [b.fecha, contado, esperado, uid],
+      sql: `INSERT INTO cierres (fecha, contado, esperado, usuario_id, creado) VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(fecha) DO UPDATE SET contado = excluded.contado, esperado = excluded.esperado, usuario_id = excluded.usuario_id, creado = excluded.creado`,
+      args: [b.fecha, contado, esperado, uid, ahora()],
     });
     return { contado, esperado, diferencia: Math.round((contado - esperado) * 100) / 100 };
   },
@@ -406,7 +412,7 @@ const routes = {
     return {
       // solo en el informe de un día: la caja se cuenta día por día
       apertura: rango[0] === rango[1] ? (await one('SELECT monto FROM aperturas WHERE fecha = ?', [rango[0]]))?.monto ?? null : null,
-      cierre: rango[0] === rango[1] ? (await one(`SELECT c.contado, c.esperado, u.nombre AS usuario FROM cierres c
+      cierre: rango[0] === rango[1] ? (await one(`SELECT c.contado, c.esperado, c.creado, u.nombre AS usuario FROM cierres c
         LEFT JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha = ?`, [rango[0]])) ?? null : null,
       // cuánto vendió cada persona (null = ventas de antes de haber usuarios)
       por_usuario: await all(`SELECT u.nombre AS usuario, COUNT(DISTINCT m.id) AS lineas, SUM(-m.cantidad * m.precio_unitario) AS total

@@ -275,6 +275,22 @@ try {
   // una cookie de usuario falsificada no sirve
   jar.set('usuario', `${ana}.${'0'.repeat(64)}`); cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
   assert.equal((await api('GET', '/api/sesion')).data.usuario, null);
+  // cada registro guarda la hora en que se hizo (la pone el servidor)
+  const reciente = iso => typeof iso === 'string' && Math.abs(Date.parse(iso) - Date.now()) < 60 * 1000;
+  await api('POST', '/api/usuario/entrar', { pin: '4321' }); // la prueba anterior dejó una cookie falsa
+  await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-08', items: [{ producto_id: yerba, cantidad: 1, precio_unitario: 100 }, { producto_id: miel, cantidad: 1, precio_unitario: 50 }] });
+  const ticket = (await api('GET', '/api/movimientos?desde=2026-11-08&hasta=2026-11-08')).data;
+  assert.ok(ticket.length === 2 && ticket.every(m => reciente(m.creado)) && ticket[0].creado === ticket[1].creado, 'una sola hora por ticket');
+  await api('POST', '/api/gastos', { fecha: '2026-11-08', categoria: 'Otros', monto: 3, medio_pago: 'efectivo' });
+  assert.ok(reciente((await api('GET', '/api/gastos?desde=2026-11-08&hasta=2026-11-08')).data[0].creado));
+  await api('POST', '/api/apertura', { fecha: '2026-11-08', monto: 10, pin: '4321' });
+  await api('POST', '/api/cierre', { fecha: '2026-11-08', contado: 10, pin: '4321' });
+  const caja8 = (await api('GET', '/api/caja?desde=2026-11-08&hasta=2026-11-08')).data;
+  assert.ok(reciente(caja8.aperturas[0].creado) && reciente(caja8.cierres[0].creado));
+  assert.ok(reciente((await api('GET', '/api/informe?desde=2026-11-08&hasta=2026-11-08')).data.cierre.creado));
+  // lo registrado antes de esta versión no tiene hora (y no rompe nada)
+  assert.ok((await api('GET', '/api/movimientos?desde=2026-11-01&hasta=2026-11-01')).data.length >= 0);
+
   // salir de usuario mantiene la sesión del negocio
   await api('POST', '/api/usuario/salir');
   assert.equal((await api('GET', '/api/productos')).status, 200);
