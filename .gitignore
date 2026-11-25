@@ -19,3 +19,5 @@ node_modules/
 *.mp4
 *.mov
 *.3gp
+# configuración local de Claude Code (rutas de esta PC)
+.claude/

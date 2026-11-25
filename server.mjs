@@ -80,6 +80,13 @@ const num = (v, campo, min = 0) => {
 const idDe = q => { const id = Number(q.get('id')); check(Number.isInteger(id) && id > 0, 'Identificador inválido'); return id; };
 const VENTAS = ['minorista', 'mayorista'];
 const MEDIOS = ['efectivo', 'transferencia'];
+const CATEGORIAS_GASTO = ['Mercadería', 'Bolsitas y descartables', 'Alquiler', 'Servicios', 'Sueldos', 'Impuestos', 'Marketing', 'Otros'];
+// fecha que existe de verdad (no 31/02) y en un rango razonable (no año 9999)
+const fechaOk = s => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s ?? '')) return false;
+  const [y, m, d] = s.split('-').map(Number), f = new Date(Date.UTC(y, m - 1, d));
+  return y >= 2020 && y <= 2100 && f.getUTCMonth() === m - 1 && f.getUTCDate() === d;
+};
 
 // ---------- login ----------
 // Sin APP_PASSWORD (uso local en la PC del negocio) no se pide contraseña.
@@ -154,15 +161,17 @@ const routes = {
   // { tipo, fecha, medio_pago, items: [{ producto_id, cantidad, precio_unitario }] }
   'POST /api/movimientos': async (b) => {
     check(['minorista', 'mayorista', 'compra', 'ajuste'].includes(b.tipo), 'Tipo inválido');
-    check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
+    check(fechaOk(b.fecha), 'Fecha inválida');
     check(Array.isArray(b.items) && b.items.length, 'No hay productos cargados');
     check(b.items.every(it => it && typeof it === 'object'), 'Producto inexistente');
     const venta = VENTAS.includes(b.tipo);
     check(!venta || MEDIOS.includes(b.medio_pago), 'Elegí el medio de pago');
     const ids = [...new Set(b.items.map(it => Number(it.producto_id)))];
     check(ids.every(Number.isInteger), 'Producto inexistente');
-    const existen = await all(`SELECT id, costo FROM productos WHERE id IN (${ids.map(() => '?')})`, ids);
+    const existen = await all(`SELECT id, nombre, costo, activo FROM productos WHERE id IN (${ids.map(() => '?')})`, ids);
     check(existen.length === ids.length, 'Producto inexistente');
+    const inactivo = existen.find(p => !p.activo);
+    check(!venta || !inactivo, `"${inactivo?.nombre}" está desactivado: activalo en Productos para venderlo`);
     // el costo se guarda en cada venta: si después cambia, la ganancia de meses anteriores no se altera
     const costo = Object.fromEntries(existen.map(p => [p.id, p.costo]));
     // se valida todo antes de escribir; batch = todo o nada
@@ -170,14 +179,37 @@ const routes = {
       // En ajustes la cantidad viene con signo (+ sobrante, - faltante); en el resto, positiva.
       const cant = b.tipo === 'ajuste' ? num(it.cantidad, 'Cantidad', -Infinity) : num(it.cantidad, 'Cantidad');
       check(cant !== 0, 'La cantidad no puede ser 0');
+      const precio = num(it.precio_unitario, 'Precio');
+      check(!venta || precio > 0, 'Hay un producto con precio $0: cargale el precio antes de cobrar');
       return {
         sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago) VALUES (?,?,?,?,?,?,?)',
-        args: [b.fecha, b.tipo, Number(it.producto_id), venta ? -cant : cant, num(it.precio_unitario, 'Precio'),
+        args: [b.fecha, b.tipo, Number(it.producto_id), venta ? -cant : cant, precio,
           costo[Number(it.producto_id)], venta ? b.medio_pago : ''],
       };
     });
     await db.batch(stmts, 'write');
     return { ok: true, cargados: stmts.length };
+  },
+
+  // sección Stock: entró mercadería, salió (rotura, vencido, consumo) o "conté y hay X"
+  'POST /api/stock': async (b) => {
+    check(['entrada', 'salida', 'contar'].includes(b.accion), 'Acción inválida');
+    check(fechaOk(b.fecha), 'Fecha inválida');
+    const id = Number(b.producto_id);
+    check(Number.isInteger(id) && id > 0, 'Producto inexistente');
+    const p = await one('SELECT costo, stock FROM stock WHERE id = ?', [id]);
+    check(p, 'Producto inexistente');
+    check(b.cantidad !== '' && b.cantidad != null, 'Poné la cantidad');
+    const cant = num(b.cantidad, 'Cantidad');
+    check(b.accion === 'contar' || cant > 0, 'La cantidad tiene que ser mayor a 0');
+    // al contar, la diferencia se calcula contra el stock de este momento (no el que tenía la pantalla)
+    const mov = b.accion === 'entrada' ? cant : b.accion === 'salida' ? -cant : Math.round((cant - p.stock) * 1000) / 1000;
+    if (mov === 0) return { ok: true, movimiento: 0 };
+    await db.execute({
+      sql: "INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago) VALUES (?,?,?,?,0,?,'')",
+      args: [b.fecha, b.accion === 'entrada' ? 'compra' : 'ajuste', id, mov, p.costo],
+    });
+    return { ok: true, movimiento: mov };
   },
 
   'GET /api/movimientos': (_, q) =>
@@ -196,9 +228,9 @@ const routes = {
       [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99']),
 
   'POST /api/gastos': async (b) => {
-    check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
+    check(fechaOk(b.fecha), 'Fecha inválida');
     const categoria = String(b.categoria ?? '').trim();
-    check(categoria, 'Elegí una categoría');
+    check(CATEGORIAS_GASTO.includes(categoria), 'Elegí una categoría de la lista');
     const monto = num(b.monto, 'Monto');
     check(monto > 0, 'El monto tiene que ser mayor a 0');
     check(MEDIOS.includes(b.medio_pago), 'Elegí con qué se pagó');
@@ -215,13 +247,13 @@ const routes = {
 
   'GET /api/apertura': async (_, q) => {
     const fecha = q.get('fecha') ?? '';
-    check(/^\d{4}-\d{2}-\d{2}$/.test(fecha), 'Fecha inválida');
+    check(fechaOk(fecha), 'Fecha inválida');
     return { monto: (await one('SELECT monto FROM aperturas WHERE fecha = ?', [fecha]))?.monto ?? null };
   },
 
   // se puede volver a mandar para corregir el monto del día
   'POST /api/apertura': async (b) => {
-    check(/^\d{4}-\d{2}-\d{2}$/.test(b.fecha ?? ''), 'Fecha inválida');
+    check(fechaOk(b.fecha), 'Fecha inválida');
     check(b.monto !== '' && b.monto != null, 'Poné con cuánto efectivo empezás (puede ser 0)');
     const monto = num(b.monto, 'Monto');
     await db.execute({ sql: 'INSERT INTO aperturas (fecha, monto) VALUES (?, ?) ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto',
@@ -232,7 +264,7 @@ const routes = {
   // informe de un período (día, semana o mes): ?desde=AAAA-MM-DD&hasta=AAAA-MM-DD
   'GET /api/informe': async (_, q) => {
     const rango = [q.get('desde') ?? '', q.get('hasta') ?? ''];
-    check(rango.every(f => /^\d{4}-\d{2}-\d{2}$/.test(f)), 'Período inválido');
+    check(rango.every(fechaOk) && rango[0] <= rango[1], 'Período inválido');
     return {
       // solo en el informe de un día: la caja se cuenta día por día
       apertura: rango[0] === rango[1] ? (await one('SELECT monto FROM aperturas WHERE fecha = ?', [rango[0]]))?.monto ?? null : null,

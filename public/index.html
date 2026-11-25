@@ -171,6 +171,10 @@
   #tema { background: transparent; color: inherit; border-color: rgba(255,255,255,.4); padding: 5px 8px; line-height: 0; }
   #tema svg { width: 18px; height: 18px; }
   .acciones { margin-left: auto; display: flex; gap: 6px; }
+  #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); z-index: 20; max-width: min(520px, calc(100vw - 32px));
+    padding: 12px 16px; border-radius: 10px; background: var(--ink); color: var(--bg); box-shadow: 0 4px 16px var(--shadow); font-size: 14px; }
+  #toast.error { background: var(--warn); color: #fff; }
+  @media (max-width: 820px) { #toast { bottom: 150px; } } /* arriba de la barra del ticket */
   /* skeleton de carga: bloque gris con brillo que recorre */
   .skel { display: block; max-width: 100%; border-radius: 6px; color: transparent;
     background: linear-gradient(90deg, var(--skel) 25%, var(--skel-brillo) 50%, var(--skel) 75%); background-size: 200% 100%;
@@ -191,6 +195,7 @@
   <h1><img src="/logo-chico.jpg" alt="" class="logo">El Morterito</h1>
   <nav>
     <button data-tab="cargar" class="on">Vender</button>
+    <button data-tab="stock">Stock</button>
     <button data-tab="productos">Productos</button>
     <button data-tab="movimientos">Historial</button>
     <button data-tab="gastos">Gastos</button>
@@ -201,6 +206,26 @@
     <button id="salir" hidden>Salir</button>
   </div>
 </header>
+
+<dialog id="dlgStock" aria-labelledby="stockTitulo">
+  <form id="formStock">
+    <h2 id="stockTitulo"></h2>
+    <p class="muted" id="stockActual" style="margin:0"></p>
+    <div class="seg" id="stockAccion" role="group" aria-label="Qué pasó" style="margin:0">
+      <button type="button" data-accion="entrada">Entró</button>
+      <button type="button" data-accion="salida">Salió</button>
+      <button type="button" data-accion="contar">Conté</button>
+    </div>
+    <label><span id="stockPregunta"></span><input type="number" name="cantidad" step="any" min="0" inputmode="decimal" required></label>
+    <p class="muted" id="stockAyuda" style="margin:0"></p>
+    <label>Fecha<input type="date" name="fecha" required></label>
+    <button class="primary big">Guardar</button>
+    <button type="button" class="link" id="stockCancelar" style="color:var(--muted)">Cancelar</button>
+    <div class="msg" id="msgStock" style="margin:0"></div>
+  </form>
+</dialog>
+
+<div id="toast" role="status" aria-live="polite" hidden></div>
 
 <dialog id="dlgApertura" aria-labelledby="aperturaTitulo">
   <form id="formApertura">
@@ -230,8 +255,6 @@
         <div class="seg" id="tipos">
           <button data-tipo="minorista">Minorista</button>
           <button data-tipo="mayorista">Mayorista</button>
-          <button data-tipo="compra">Compra</button>
-          <button data-tipo="ajuste">Ajuste</button>
         </div>
         <input id="q" class="search" type="search" placeholder="Buscar producto…" autocomplete="off" aria-label="Buscar producto">
         <div class="chips" id="cats" aria-label="Filtrar por categoría"></div>
@@ -259,6 +282,21 @@
     </div>
   </section>
 
+  <!-- STOCK -->
+  <section id="stock">
+    <div class="card">
+      <h2>Stock</h2>
+      <p class="muted" style="margin-top:-6px">Tocá un producto para cargar mercadería que entró, sacar lo que se rompió o venció, o corregirlo con lo que contaste.</p>
+      <input id="sBuscar" class="search" type="search" placeholder="Buscar producto…" autocomplete="off" aria-label="Buscar producto" style="margin-bottom:10px">
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Producto</th><th>Categoría</th><th class="n">Stock</th><th class="n">Mínimo</th></tr></thead>
+          <tbody id="tablaStock"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <!-- PRODUCTOS -->
   <section id="productos">
     <div class="card">
@@ -283,6 +321,7 @@
         <div class="row" style="margin-top:12px">
           <button class="primary">Guardar producto</button>
           <button type="button" id="pCancelar" hidden>Cancelar</button>
+          <button type="button" id="pStock" hidden>Cambiar stock</button>
           <button type="button" class="link" id="pBorrar" hidden style="margin-left:auto">Borrar producto</button>
         </div>
         <div class="msg" id="msgProd"></div>
@@ -296,7 +335,7 @@
       </div>
       <div class="scroll">
         <table>
-          <thead><tr><th>Producto</th><th>Categoría</th><th class="n">Stock</th><th class="n">Mínimo</th><th class="n">Costo</th><th class="n">Minorista</th><th class="n">Mayorista</th><th class="n">Ganás (min.)</th></tr></thead>
+          <thead><tr><th>Producto</th><th>Categoría</th><th class="n">Stock</th><th class="n">Mínimo</th><th class="n">Costo</th><th class="n">Minorista</th><th class="n">Mayorista</th><th class="n">Ganancia minorista</th></tr></thead>
           <tbody id="tablaProd"></tbody>
         </table>
       </div>
@@ -419,7 +458,14 @@ async function api(method, path, body) {
 }
 function flash(el, text, bad) { el.textContent = text; el.className = 'msg ' + (bad ? 'bad' : 'muted'); }
 // para cargas de secciones: que un error se vea (sin sesión ya se muestra el login)
-const avisar = err => { if (err.status !== 401) alert(err.message); };
+const avisar = err => { if (err.status !== 401) toast(err.message, true); };
+// aviso que aparece abajo y se va solo (en vez de la ventana alert del navegador)
+let toastTimer;
+function toast(text, error = false) {
+  const t = $('#toast');
+  t.textContent = text; t.className = error ? 'error' : ''; t.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, error ? 7000 : 4000);
+}
 
 // ---------- tema claro / oscuro ----------
 // el botón muestra el modo al que se pasa: luna en claro, sol en oscuro
@@ -461,7 +507,7 @@ let productos = [];
 
 async function cargarProductos() {
   productos = await api('GET', '/api/productos');
-  pintarTiles();
+  pintarTiles(); pintarStock();
   $('#catlist').innerHTML = [...new Set(productos.map(p => p.categoria).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('');
   pintarProductos();
 }
@@ -491,15 +537,68 @@ $('#tablaProd').onclick = e => {
   for (const k of ['id', 'nombre', 'categoria', 'unidad', 'costo', 'precio_minorista', 'precio_mayorista', 'stock_minimo']) f[k].value = p[k];
   f.activo.checked = !!p.activo;
   $('#pTitulo').textContent = 'Editar: ' + p.nombre;
-  $('#stockIniWrap').hidden = true; $('#activoWrap').hidden = false; $('#pCancelar').hidden = $('#pBorrar').hidden = false;
-  flash($('#msgProd'), 'Para cambiar el stock usá Compra o Ajuste en "Vender".');
+  $('#stockIniWrap').hidden = true; $('#activoWrap').hidden = false; $('#pCancelar').hidden = $('#pBorrar').hidden = $('#pStock').hidden = false;
+  flash($('#msgProd'), 'Para cambiar el stock tocá "Cambiar stock".');
   scrollTo({ top: 0, behavior: 'smooth' });
 };
 function resetProd() {
   $('#formProd').reset(); $('#formProd').id.value = '';
   $('#pTitulo').textContent = 'Nuevo producto';
-  $('#stockIniWrap').hidden = false; $('#activoWrap').hidden = true; $('#pCancelar').hidden = $('#pBorrar').hidden = true;
+  $('#stockIniWrap').hidden = false; $('#activoWrap').hidden = true; $('#pCancelar').hidden = $('#pBorrar').hidden = $('#pStock').hidden = true;
 }
+$('#pStock').onclick = () => { const p = productos.find(p => p.id == $('#formProd').id.value); if (p) abrirStock(p); };
+
+// ---------- stock: entró, salió o conté ----------
+function pintarStock() {
+  const f = norm($('#sBuscar').value.trim());
+  $('#tablaStock').innerHTML = productos.filter(p => coincide(p, f))
+    .map(p => `<tr class="click ${p.activo && p.stock <= p.stock_minimo ? 'bajo' : ''}" data-id="${p.id}">
+      <td>${esc(p.nombre)}${p.activo ? '' : ' <span class="muted">(inactivo)</span>'}</td><td>${esc(p.categoria)}</td>
+      <td class="n">${cuanto(p.stock, p.unidad)}</td><td class="n">${qty(p.stock_minimo)}</td></tr>`).join('')
+    || '<tr><td colspan="4" class="muted">Sin productos.</td></tr>';
+}
+$('#sBuscar').oninput = pintarStock;
+$('#tablaStock').onclick = e => { const p = productos.find(p => p.id == e.target.closest('tr')?.dataset.id); if (p) abrirStock(p); };
+const ACCIONES = {
+  entrada: ['¿Cuánto entró?', 'Suma al stock. Lo que le pagaste al proveedor cargalo en "Gastos".'],
+  salida: ['¿Cuánto salió?', 'Resta del stock: rotura, vencido, consumo propio.'],
+  contar: ['¿Cuánto hay ahora?', 'Poné lo que contaste y la app corrige la diferencia.'],
+};
+const dlgStock = $('#dlgStock');
+let stockProd = null, stockAccion = 'entrada';
+function setAccion(a) {
+  stockAccion = a;
+  document.querySelectorAll('#stockAccion button').forEach(b => b.classList.toggle('on', b.dataset.accion === a));
+  $('#stockPregunta').textContent = ACCIONES[a][0];
+  ayudaStock();
+}
+// explica la acción y muestra cómo va a quedar el stock con lo que se escribió
+function ayudaStock() {
+  const v = $('#formStock').cantidad.value, c = Number(v), p = stockProd;
+  const queda = stockAccion === 'entrada' ? p.stock + c : stockAccion === 'salida' ? p.stock - c : c;
+  $('#stockAyuda').innerHTML = esc(ACCIONES[stockAccion][1]) + (v !== '' && Number.isFinite(c) ? ` Va a quedar en <b>${cuanto(queda, p.unidad)}</b>.` : '');
+}
+function abrirStock(p) {
+  stockProd = p;
+  $('#stockTitulo').textContent = p.nombre;
+  $('#stockActual').innerHTML = `Stock actual: <b>${cuanto(p.stock, p.unidad)}</b>`;
+  const f = $('#formStock'); f.cantidad.value = ''; f.fecha.value = hoy(); flash($('#msgStock'), '');
+  setAccion('entrada');
+  dlgStock.showModal();
+}
+$('#stockAccion').onclick = e => { if (e.target.dataset.accion) { setAccion(e.target.dataset.accion); $('#formStock').cantidad.focus(); } };
+$('#formStock').cantidad.oninput = ayudaStock;
+$('#stockCancelar').onclick = () => dlgStock.close();
+$('#formStock').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, p = stockProd, antes = p.stock;
+  try {
+    const { movimiento } = await api('POST', '/api/stock', { producto_id: p.id, accion: stockAccion, cantidad: f.cantidad.value, fecha: f.fecha.value });
+    dlgStock.close(); await cargarProductos();
+    const ahora = productos.find(x => x.id === p.id)?.stock;
+    toast(movimiento ? `${p.nombre}: stock ${qty(antes)} → ${qty(ahora)}` : `${p.nombre}: el stock ya era ${qty(ahora)}, no hubo cambios`);
+  } catch (err) { flash($('#msgStock'), err.message, true); }
+};
 $('#pBorrar').onclick = async () => {
   const f = $('#formProd'), nombre = f.nombre.value;
   if (!confirm(`¿Borrar "${nombre}"? No se puede deshacer.`)) return;
@@ -645,6 +744,8 @@ $('#lineas').oninput = e => {
 $('#limpiar').onclick = () => { lineas = []; pintarLineas(); flash($('#msgCargar'), ''); enfocarBusqueda(); };
 $('#guardar').onclick = async () => {
   if (lineas.some(l => !l.cantidad)) return flash($('#msgCargar'), 'Hay un producto con cantidad 0.', true);
+  const sinPrecio = lineas.find(l => !(l.precio > 0));
+  if (sinPrecio) return flash($('#msgCargar'), `"${sinPrecio.p.nombre}" tiene precio $0: escribí el precio o cargalo en Productos.`, true);
   revisarDia(); // que una venta hecha pasada la medianoche no quede con la fecha de ayer
   const btn = $('#guardar'), total = totalTicket(); btn.disabled = true;
   try {
@@ -657,9 +758,10 @@ $('#guardar').onclick = async () => {
 };
 
 // ---------- movimientos ----------
+let movs = [];
 async function verMovimientos() {
   skelFilas($('#tablaMov'), 7, 6);
-  const rows = await api('GET', `/api/movimientos?desde=${$('#mDesde').value}&hasta=${$('#mHasta').value}`);
+  const rows = movs = await api('GET', `/api/movimientos?desde=${$('#mDesde').value}&hasta=${$('#mHasta').value}`);
   $('#tablaMov').innerHTML = rows.map(m => {
     const venta = m.tipo === 'minorista' || m.tipo === 'mayorista', c = venta ? -m.cantidad : m.cantidad;
     return `<tr><td>${m.fecha.split('-').reverse().join('/')}</td><td>${TIPOS[m.tipo]}${MEDIO[m.medio_pago] ? ` <span class="muted">· ${MEDIO[m.medio_pago]}</span>` : ''}</td><td>${esc(m.nombre)}</td>
@@ -671,16 +773,24 @@ async function verMovimientos() {
 $('#mVer').onclick = () => verMovimientos().catch(avisar);
 $('#tablaMov').onclick = async e => {
   const id = e.target.dataset.id;
-  if (!id || !confirm('¿Borrar este movimiento? El stock se recalcula solo.')) return;
+  if (!id) return;
+  // avisar si el stock quedaría negativo (p. ej. borrar la compra de algo que ya se vendió)
+  const m = movs.find(x => x.id == id), p = productos.find(x => x.id === m?.producto_id);
+  const queda = p ? p.stock - m.cantidad : 0;
+  const ojo = p && queda < 0 ? `
+
+Ojo: el stock de "${p.nombre}" va a quedar en ${qty(queda)}.` : '';
+  if (!confirm('¿Borrar este movimiento? El stock se recalcula solo.' + ojo)) return;
   try { await api('DELETE', '/api/movimientos?id=' + id); await verMovimientos(); await cargarProductos(); }
-  catch (err) { alert(err.message); }
+  catch (err) { toast(err.message, true); }
 };
 
 // ---------- gastos ----------
 async function verGastos() {
   const mes = $('#gMes').value;
   skelFilas($('#tablaGastos'), 6, 4);
-  const rows = await api('GET', `/api/gastos?desde=${mes}-01&hasta=${mes}-31`);
+  const [y, m] = mes.split('-').map(Number);
+  const rows = await api('GET', `/api/gastos?desde=${mes}-01&hasta=${iso(new Date(y, m, 0))}`); // último día real del mes
   $('#gTotal').textContent = 'Total del mes: ' + money(rows.reduce((s, g) => s + g.monto, 0));
   $('#tablaGastos').innerHTML = rows.map(g => `<tr><td>${g.fecha.split('-').reverse().join('/')}</td><td>${esc(g.categoria)}</td>
       <td>${esc(g.concepto)}</td><td>${MEDIO[g.medio_pago] ?? ''}</td><td class="n">${money(g.monto)}</td>
@@ -701,7 +811,7 @@ $('#formGasto').onsubmit = async e => {
 $('#tablaGastos').onclick = async e => {
   const id = e.target.dataset.id;
   if (!id || !confirm('¿Borrar este gasto?')) return;
-  try { await api('DELETE', '/api/gastos?id=' + id); await verGastos(); } catch (err) { alert(err.message); }
+  try { await api('DELETE', '/api/gastos?id=' + id); await verGastos(); } catch (err) { toast(err.message, true); }
 };
 
 // ---------- informes ----------
@@ -828,7 +938,7 @@ api('GET', '/api/sesion').then(s => {
   if (s.ok) {
     // si falla, avisar en vez de mostrar la lista vacía como si no hubiera productos
     skelTiles(); skelFilas($('#tablaProd'), 8, 5);
-    cargarProductos().catch(err => alert('No se pudieron cargar los productos. Recargá la página.\n\n' + err.message));
+    cargarProductos().catch(err => toast('No se pudieron cargar los productos. Recargá la página. ' + err.message, true));
     verificarApertura().catch(() => {});
   } else { $('#login').hidden = false; $('#pass').focus(); }
 });

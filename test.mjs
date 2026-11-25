@@ -160,6 +160,44 @@ try {
   assert.deepEqual([roto.status, (await roto.json()).error], [400, 'JSON inválido']);
   assert.equal((await api('GET', '/api/nada')).status, 404);
 
+  // fechas: tienen que existir y ser razonables
+  const compraEn = fecha => api('POST', '/api/movimientos', { tipo: 'compra', fecha, items: [{ producto_id: yerba, cantidad: 1 }] });
+  for (const f of ['2026-02-31', '2026-13-01', '9999-12-31', '1999-01-01', '2026-2-3']) assert.equal((await compraEn(f)).status, 400, f);
+  for (const f of ['2028-02-29', '2026-12-31']) assert.equal((await compraEn(f)).status, 200, f);
+  assert.equal((await api('POST', '/api/apertura', { fecha: '2026-02-30', monto: 1 })).status, 400);
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-30&hasta=2026-11-01')).status, 400); // al revés
+
+  // ventas a $0 no; compras y ajustes sí van sin precio
+  const venta0 = await api('POST', '/api/movimientos', { tipo: 'mayorista', medio_pago: 'efectivo', fecha: '2026-11-04', items: [{ producto_id: yerba, cantidad: 1, precio_unitario: 0 }] });
+  assert.deepEqual([venta0.status, /precio \$0/.test(venta0.data.error)], [400, true]);
+
+  // productos desactivados: no se venden (aunque se mande a mano), pero se les puede ajustar el stock
+  const viejo = (await api('GET', '/api/productos')).data.find(p => p.nombre === 'Viejo');
+  await api('POST', '/api/productos', { ...viejo, activo: false });
+  const ventaInactivo = await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-04', items: [{ producto_id: viejo.id, cantidad: 1, precio_unitario: 5 }] });
+  assert.deepEqual([ventaInactivo.status, /desactivado/.test(ventaInactivo.data.error)], [400, true]);
+  assert.equal((await api('POST', '/api/movimientos', { tipo: 'ajuste', fecha: '2026-11-04', items: [{ producto_id: viejo.id, cantidad: 2 }] })).status, 200);
+
+  // gastos: solo categorías de la lista
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-04', categoria: 'Cualquiera', monto: 10, medio_pago: 'efectivo' })).status, 400);
+
+  // sección Stock: entró / salió / conté
+  const stockDe = async id => (await api('GET', '/api/productos')).data.find(p => p.id === id).stock;
+  const s0 = await stockDe(yerba);
+  const st = (accion, cantidad) => api('POST', '/api/stock', { producto_id: yerba, accion, cantidad, fecha: '2026-11-05' });
+  assert.equal((await st('entrada', 4)).data.movimiento, 4);
+  assert.equal((await st('salida', 1.5)).data.movimiento, -1.5);
+  assert.equal(await stockDe(yerba), s0 + 2.5);
+  assert.equal((await st('contar', 10)).data.movimiento, 10 - (s0 + 2.5)); // corrige la diferencia
+  assert.equal(await stockDe(yerba), 10);
+  assert.equal((await st('contar', 10)).data.movimiento, 0); // ya estaba bien: no se registra nada
+  assert.equal((await st('contar', 0)).status, 200); // contar 0 vale (se terminó)
+  assert.equal(await stockDe(yerba), 0);
+  for (const [a, c] of [['entrada', 0], ['salida', -1], ['entrada', ''], ['robo', 1]]) assert.equal((await st(a, c)).status, 400, `${a} ${c}`);
+  assert.equal((await api('POST', '/api/stock', { producto_id: 99999, accion: 'entrada', cantidad: 1, fecha: '2026-11-05' })).status, 400);
+  const tipos = (await api('GET', '/api/movimientos?desde=2026-11-05&hasta=2026-11-05')).data.map(m => m.tipo);
+  assert.ok(tipos.includes('compra') && tipos.includes('ajuste')); // entrada = compra; salida y conté = ajuste
+
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);
   console.log('OK — todas las pruebas pasaron');
