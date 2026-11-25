@@ -21,3 +21,5 @@ node_modules/
 *.3gp
 # configuración local de Claude Code (rutas de esta PC)
 .claude/
+# informes de revisión (no van al repo)
+informe-el-morterito.md
