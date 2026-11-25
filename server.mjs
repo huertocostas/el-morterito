@@ -142,6 +142,15 @@ async function quien(req) {
   if (await one('SELECT 1 AS hay FROM usuarios WHERE activo = 1 LIMIT 1')) throw new SinUsuario('Ingresá tu PIN para registrar quién atiende');
   return null;
 }
+// apertura y cierre de caja se confirman con el PIN de quien los hace (aunque la sesión sea de otra persona)
+async function confirmarConPin(b) {
+  const activos = await all('SELECT id, pin FROM usuarios WHERE activo = 1');
+  if (!activos.length) return null; // sin usuarios cargados no se pide
+  const pin = String(b.pin ?? '');
+  const u = /^\d{4,8}$/.test(pin) && activos.find(u => pinCoincide(pin, u.pin));
+  if (!u) { await esperar(800); throw new BadRequest(pin ? 'PIN incorrecto' : 'Poné tu PIN para confirmar'); }
+  return u.id;
+}
 
 // efectivo que tiene que haber en la caja un día: apertura + ventas en efectivo − gastos en efectivo
 async function efectivoEsperado(fecha) {
@@ -312,6 +321,17 @@ const routes = {
     return { ok: true, movimiento: mov };
   },
 
+  // aperturas y cierres de caja de un período, con quién los hizo (para el historial)
+  'GET /api/caja': async (_, q) => {
+    const r = [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99'];
+    return {
+      aperturas: await all(`SELECT a.fecha, a.monto, u.nombre AS usuario FROM aperturas a
+        LEFT JOIN usuarios u ON u.id = a.usuario_id WHERE a.fecha BETWEEN ? AND ? ORDER BY a.fecha DESC`, r),
+      cierres: await all(`SELECT c.fecha, c.contado, c.esperado, u.nombre AS usuario FROM cierres c
+        LEFT JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha BETWEEN ? AND ? ORDER BY c.fecha DESC`, r),
+    };
+  },
+
   'GET /api/movimientos': (_, q) =>
     all(`SELECT m.*, p.nombre, p.unidad, u.nombre AS usuario FROM movimientos m JOIN productos p ON p.id = m.producto_id
       LEFT JOIN usuarios u ON u.id = m.usuario_id
@@ -358,7 +378,7 @@ const routes = {
     check(fechaOk(b.fecha), 'Fecha inválida');
     check(b.monto !== '' && b.monto != null, 'Poné con cuánto efectivo empezás (puede ser 0)');
     const monto = num(b.monto, 'Monto');
-    const uid = await quien(req);
+    const uid = await confirmarConPin(b);
     await db.execute({ sql: 'INSERT INTO aperturas (fecha, monto, usuario_id) VALUES (?, ?, ?) ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto, usuario_id = excluded.usuario_id',
       args: [b.fecha, monto, uid] });
     return { ok: true };
@@ -369,7 +389,7 @@ const routes = {
     check(fechaOk(b.fecha), 'Fecha inválida');
     check(b.contado !== '' && b.contado != null, 'Poné cuánto efectivo contaste');
     const contado = num(b.contado, 'Efectivo contado');
-    const uid = await quien(req);
+    const uid = await confirmarConPin(b);
     const esperado = await efectivoEsperado(b.fecha);
     await db.execute({
       sql: `INSERT INTO cierres (fecha, contado, esperado, usuario_id) VALUES (?, ?, ?, ?)

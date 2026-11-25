@@ -42,10 +42,18 @@
   * { box-sizing: border-box; }
   [hidden] { display: none !important; } /* si no, label {display:flex} le gana al atributo hidden */
   body { margin: 0; font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--ink); }
-  header { background: var(--header); color: var(--header-ink); padding: 12px 20px; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; }
+  header { background: var(--header); color: var(--header-ink); padding: 12px 20px; display: flex; gap: 16px; align-items: center; flex-wrap: nowrap; }
   header h1 { margin: 0; font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
   .logo { width: 42px; height: 42px; border-radius: 8px; background: #fff; }
-  nav { display: flex; gap: 4px; flex-wrap: wrap; }
+  /* el menú se achica y se desliza antes que empujar los botones a otra fila */
+  nav { display: flex; gap: 4px; flex-wrap: nowrap; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  nav button { white-space: nowrap; }
+  /* pantallas medianas: el menú pasa a su propia fila para que se vean todas las secciones */
+  @media (max-width: 1000px) {
+    header { flex-wrap: wrap; row-gap: 6px; }
+    nav { order: 3; flex-basis: 100%; }
+    .acciones { margin-left: auto; }
+  }
   nav button { background: transparent; color: inherit; border: 0; padding: 8px 14px; border-radius: 6px; font: inherit; cursor: pointer; opacity: .8; }
   nav button.on { background: rgba(255,255,255,.18); opacity: 1; }
   main { max-width: 1200px; margin: 0 auto; padding: 20px 16px 60px; }
@@ -67,6 +75,7 @@
   td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
   tr.click { cursor: pointer; } tr.click:hover { background: var(--hover); }
   tr.bajo td { background: var(--warn-bg); }
+  tr.caja td { background: var(--hover); font-weight: 500; } /* aperturas y cierres se distinguen en el historial */
   .muted { color: var(--muted); font-size: 13px; }
   .bad { color: var(--warn); }
   .msg { min-height: 22px; margin-top: 8px; }
@@ -126,7 +135,7 @@
   .ver-ticket { display: none; }
   @media (max-width: 820px) {
     /* dos filas: logo + Salir arriba, secciones abajo */
-    header { padding: 8px; gap: 6px; }
+    header { padding: 8px; gap: 6px; flex-wrap: wrap; }
     header h1 { font-size: 16px; gap: 8px; }
     .logo { width: 36px; height: 36px; }
     nav { order: 3; flex-basis: 100%; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; gap: 2px; }
@@ -274,6 +283,7 @@
     <p class="muted" id="contarFecha" style="margin:0"></p>
     <div class="stat"><span class="muted">Tiene que haber en efectivo</span><b id="contarEsperado"></b></div>
     <label>¿Cuánto efectivo contaste?<input type="number" name="contado" min="0" step="any" inputmode="decimal" required></label>
+    <label id="contarPinWrap" hidden>Tu PIN (queda registrado a tu nombre)<input type="password" name="pin" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off"></label>
     <p id="contarDif" style="margin:0;font-weight:600"></p>
     <button class="primary big">Cerrar caja</button>
     <button type="button" class="link" id="contarCancelar" style="color:var(--muted)">Cancelar</button>
@@ -299,6 +309,8 @@
     <h2 id="aperturaTitulo">Abrir caja</h2>
     <p class="muted" id="aperturaFecha" style="margin:0"></p>
     <label>¿Con cuánto efectivo empezás?<input type="number" name="monto" min="0" step="any" inputmode="decimal" required></label>
+    <p class="muted" id="aperturaAyuda" style="margin:0">Es el efectivo con el que arranca este día: no se suma lo de días anteriores.</p>
+    <label id="aperturaPinWrap" hidden>Tu PIN (queda registrado a tu nombre)<input type="password" name="pin" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="off"></label>
     <button class="primary big">Abrir caja</button>
     <button type="button" class="link" id="aperturaCancelar" hidden style="color:var(--muted)">Cancelar</button>
     <button type="button" class="link" id="aperturaOmitir" hidden style="color:var(--muted)">Omitir por hoy</button>
@@ -831,14 +843,32 @@ $('#guardar').onclick = async () => {
 let movs = [];
 async function verMovimientos() {
   skelFilas($('#tablaMov'), 7, 6);
-  const rows = movs = await api('GET', `/api/movimientos?desde=${$('#mDesde').value}&hasta=${$('#mHasta').value}`);
-  $('#tablaMov').innerHTML = rows.map(m => {
+  const rango = `desde=${$('#mDesde').value}&hasta=${$('#mHasta').value}`;
+  const [rows, caja] = await Promise.all([api('GET', `/api/movimientos?${rango}`), api('GET', `/api/caja?${rango}`)]);
+  movs = rows;
+  const fecha = f => f.split('-').reverse().join('/'), por = u => u ? ` <span class="muted">· ${esc(u)}</span>` : '';
+  const filaMov = m => {
     const venta = m.tipo === 'minorista' || m.tipo === 'mayorista', c = venta ? -m.cantidad : m.cantidad;
-    return `<tr><td>${m.fecha.split('-').reverse().join('/')}</td><td>${TIPOS[m.tipo]}${MEDIO[m.medio_pago] ? ` <span class="muted">· ${MEDIO[m.medio_pago]}</span>` : ''}${m.usuario ? ` <span class="muted">· ${esc(m.usuario)}</span>` : ''}</td><td>${esc(m.nombre)}</td>
+    return `<tr><td>${fecha(m.fecha)}</td><td>${TIPOS[m.tipo]}${MEDIO[m.medio_pago] ? ` <span class="muted">· ${MEDIO[m.medio_pago]}</span>` : ''}${por(m.usuario)}</td><td>${esc(m.nombre)}</td>
       <td class="n">${cuanto(c, m.unidad)}</td><td class="n">${venta ? money(m.precio_unitario) : ''}</td>
       <td class="n">${venta ? money(c * m.precio_unitario) : ''}</td>
       <td class="n"><button class="link" data-id="${m.id}">Borrar</button></td></tr>`;
-  }).join('') || '<tr><td colspan="7" class="muted">Sin movimientos en esas fechas.</td></tr>';
+  };
+  // quién abrió y quién cerró la caja (se corrigen desde Informes, no se borran acá)
+  const filaApertura = a => `<tr class="caja"><td>${fecha(a.fecha)}</td><td>Apertura de caja${por(a.usuario)}</td><td>Efectivo inicial</td>
+      <td></td><td></td><td class="n">${money(a.monto)}</td><td></td></tr>`;
+  const filaCierre = c => {
+    const dif = Math.round((c.contado - c.esperado) * 100) / 100;
+    return `<tr class="caja"><td>${fecha(c.fecha)}</td><td>Cierre de caja${por(c.usuario)}</td>
+      <td>Contado <span class="${dif < 0 ? 'bad' : 'muted'}">(${dif === 0 ? 'justo' : dif > 0 ? `sobraron ${money(dif)}` : `faltaron ${money(-dif)}`})</span></td>
+      <td></td><td></td><td class="n">${money(c.contado)}</td><td></td></tr>`;
+  };
+  // de lo más nuevo a lo más viejo; en cada día: el cierre arriba, los movimientos y la apertura abajo
+  const dias = [...new Set([...rows.map(m => m.fecha), ...caja.aperturas.map(a => a.fecha), ...caja.cierres.map(c => c.fecha)])].sort().reverse();
+  $('#tablaMov').innerHTML = dias.map(d => caja.cierres.filter(c => c.fecha === d).map(filaCierre).join('')
+      + rows.filter(m => m.fecha === d).map(filaMov).join('')
+      + caja.aperturas.filter(a => a.fecha === d).map(filaApertura).join('')).join('')
+    || '<tr><td colspan="7" class="muted">Sin movimientos en esas fechas.</td></tr>';
 }
 $('#mVer').onclick = () => verMovimientos().catch(avisar);
 $('#tablaMov').onclick = async e => {
@@ -914,6 +944,21 @@ $('#iCaja').onclick = e => {
 // ---------- apertura de caja ----------
 // al entrar, si hoy no se abrió la caja, se pide el efectivo inicial (puede ser 0, o se omite por hoy)
 const dlgApertura = $('#dlgApertura');
+// con usuarios cargados, abrir y cerrar caja piden el PIN de quien lo hace
+function pedirPinEn(sel) {
+  const wrap = $(sel), input = wrap.querySelector('input');
+  wrap.hidden = !hayUsuarios(); input.required = hayUsuarios(); input.value = '';
+}
+// referencia (no se suma): con cuánto cerró la caja el día anterior
+async function referenciaAyer(fecha) {
+  const [y, m, d] = fecha.split('-').map(Number), ayer = iso(new Date(y, m - 1, d - 1));
+  const base = 'Es el efectivo con el que arranca este día: no se suma lo de días anteriores.';
+  $('#aperturaAyuda').textContent = base;
+  try {
+    const { cierres } = await api('GET', `/api/caja?desde=${ayer}&hasta=${ayer}`);
+    if (cierres[0] && dlgApertura.dataset.fecha === fecha) $('#aperturaAyuda').textContent = `${base} El día anterior cerraron contando ${money(cierres[0].contado)}.`;
+  } catch {}
+}
 // preferencias de este dispositivo (si el navegador no deja guardar, se sigue funcionando igual)
 const local = {
   get: k => { try { return localStorage.getItem(k); } catch { return null; } },
@@ -929,6 +974,8 @@ function abrirApertura(fecha, monto = null, opcional = false) {
   $('#aperturaCancelar').hidden = !opcional;
   $('#aperturaOmitir').hidden = opcional; // al entrar se puede omitir; al corregir desde Informes, se cancela
   $('#formApertura').monto.value = monto ?? '';
+  pedirPinEn('#aperturaPinWrap');
+  referenciaAyer(fecha);
   flash($('#msgApertura'), '');
   dlgApertura.showModal();
 }
@@ -946,10 +993,10 @@ $('#formApertura').onsubmit = async e => {
   e.preventDefault();
   pedirPermisoAvisos();
   try {
-    await api('POST', '/api/apertura', { fecha: dlgApertura.dataset.fecha, monto: e.target.monto.value });
+    await api('POST', '/api/apertura', { fecha: dlgApertura.dataset.fecha, monto: e.target.monto.value, pin: e.target.pin.value });
     dlgApertura.dataset.listo = '1'; dlgApertura.close();
     if ($('#informes').classList.contains('on')) verInforme().catch(avisar);
-  } catch (err) { flash($('#msgApertura'), err.message, true); }
+  } catch (err) { flash($('#msgApertura'), err.message, true); e.target.pin.value = ''; }
 };
 async function verificarApertura() {
   if (local.get('aperturaOmitida') === hoy()) return;
@@ -1011,6 +1058,7 @@ function abrirContar(fecha, esperado, contado = null) {
   $('#contarFecha').textContent = new Date(y, m - 1, d).toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long' });
   $('#contarEsperado').textContent = money(esperado);
   $('#formContar').contado.value = contado ?? '';
+  pedirPinEn('#contarPinWrap');
   difContar(); flash($('#msgContar'), '');
   dlgContar.showModal();
 }
@@ -1027,12 +1075,12 @@ $('#contarCancelar').onclick = () => dlgContar.close();
 $('#formContar').onsubmit = async e => {
   e.preventDefault();
   try {
-    const r = await api('POST', '/api/cierre', { fecha: dlgContar.dataset.fecha, contado: e.target.contado.value });
+    const r = await api('POST', '/api/cierre', { fecha: dlgContar.dataset.fecha, contado: e.target.contado.value, pin: e.target.pin.value });
     if (dlgContar.dataset.fecha === hoy()) local.set('avisoCierre', hoy());
     dlgContar.close();
     toast(r.diferencia === 0 ? 'Caja cerrada: cierra justo.' : `Caja cerrada: ${r.diferencia > 0 ? 'sobran' : 'faltan'} ${money(Math.abs(r.diferencia))}.`, r.diferencia < 0);
     if ($('#informes').classList.contains('on')) verInforme().catch(avisar);
-  } catch (err) { flash($('#msgContar'), err.message, true); }
+  } catch (err) { flash($('#msgContar'), err.message, true); e.target.pin.value = ''; }
 };
 
 // ---------- usuarios: quién atiende ----------

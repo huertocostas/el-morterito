@@ -215,6 +215,14 @@ try {
   assert.deepEqual([infCierre.contado, infCierre.esperado], [2250, 2250]);
   assert.equal((await api('GET', '/api/informe?desde=2026-11-02&hasta=2026-11-08')).data.cierre, null); // semana: no aplica
 
+  // la apertura de un día no se acumula con la del anterior: cada día arranca con la suya
+  await api('POST', '/api/apertura', { fecha: '2026-11-20', monto: 1000 });
+  await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-20', items: [{ producto_id: yerba, cantidad: 1, precio_unitario: 500 }] });
+  await api('POST', '/api/apertura', { fecha: '2026-11-21', monto: 300 });
+  assert.equal((await api('POST', '/api/cierre', { fecha: '2026-11-20', contado: 1500 })).data.esperado, 1500); // 1000 + 500
+  assert.equal((await api('POST', '/api/cierre', { fecha: '2026-11-21', contado: 300 })).data.esperado, 300);   // solo la del 21
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-21&hasta=2026-11-21')).data.apertura, 300);
+
   // ---------- usuarios ----------
   // mientras no haya usuarios, se registra sin PIN (como antes)
   assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-06', categoria: 'Otros', monto: 1, medio_pago: 'efectivo' })).status, 200);
@@ -244,7 +252,16 @@ try {
   assert.deepEqual((await api('GET', '/api/informe?desde=2026-11-07&hasta=2026-11-07')).data.por_usuario.map(x => [x.usuario, x.total]), [['Ana', 100]]);
   // cambiar de persona
   await api('POST', '/api/usuario/entrar', { pin: '5678' });
-  await api('POST', '/api/cierre', { fecha: '2026-11-07', contado: 0 });
+  // con usuarios, apertura y cierre se confirman con el PIN de quien los hace
+  assert.equal((await api('POST', '/api/cierre', { fecha: '2026-11-07', contado: 0 })).status, 400);              // sin PIN
+  assert.equal((await api('POST', '/api/cierre', { fecha: '2026-11-07', contado: 0, pin: '0000' })).status, 400); // PIN mal
+  assert.equal((await api('POST', '/api/apertura', { fecha: '2026-11-07', monto: 50 })).status, 400);
+  assert.equal((await api('POST', '/api/cierre', { fecha: '2026-11-07', contado: 0, pin: '5678' })).status, 200);
+  // la sesión es de Beto, pero la apertura la confirma Ana con su PIN: queda a nombre de Ana
+  assert.equal((await api('POST', '/api/apertura', { fecha: '2026-11-07', monto: 50, pin: '1234' })).status, 200);
+  const caja7 = (await api('GET', '/api/caja?desde=2026-11-07&hasta=2026-11-07')).data;
+  assert.deepEqual(caja7.aperturas.map(a => [a.monto, a.usuario]), [[50, 'Ana']]);
+  assert.deepEqual(caja7.cierres.map(c => [c.contado, c.usuario]), [[0, 'Beto']]);
   assert.equal((await api('GET', '/api/informe?desde=2026-11-07&hasta=2026-11-07')).data.cierre.usuario, 'Beto');
   // baja: Beto ya no puede registrar con su cookie ni volver a entrar; su PIN queda libre
   const beto = usuarios.find(u => u.nombre === 'Beto').id;
