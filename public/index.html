@@ -227,6 +227,19 @@
 
 <div id="toast" role="status" aria-live="polite" hidden></div>
 
+<dialog id="dlgCierre" aria-labelledby="cierreTitulo">
+  <form method="dialog">
+    <h2 id="cierreTitulo">Hora de cerrar la caja</h2>
+    <p class="muted" style="margin:0">Contá la caja y compará con lo que dice la app.</p>
+    <div class="stats" style="grid-template-columns:1fr 1fr">
+      <div class="stat"><span class="muted">Efectivo en caja</span><b id="cierreEfectivo"></b></div>
+      <div class="stat"><span class="muted">Transferencias</span><b id="cierreTransf"></b></div>
+    </div>
+    <button class="primary big" value="ver">Ver cierre de caja</button>
+    <button class="link" value="tarde" style="color:var(--muted)">Recordarme en 15 minutos</button>
+  </form>
+</dialog>
+
 <dialog id="dlgApertura" aria-labelledby="aperturaTitulo">
   <form id="formApertura">
     <h2 id="aperturaTitulo">Abrir caja</h2>
@@ -234,6 +247,7 @@
     <label>¿Con cuánto efectivo empezás?<input type="number" name="monto" min="0" step="any" inputmode="decimal" required></label>
     <button class="primary big">Abrir caja</button>
     <button type="button" class="link" id="aperturaCancelar" hidden style="color:var(--muted)">Cancelar</button>
+    <button type="button" class="link" id="aperturaOmitir" hidden style="color:var(--muted)">Omitir por hoy</button>
     <div class="msg" id="msgApertura" style="margin:0"></div>
   </form>
 </dialog>
@@ -840,14 +854,22 @@ $('#iCaja').onclick = e => {
 };
 
 // ---------- apertura de caja ----------
-// al entrar, si hoy no se abrió la caja, se pide el efectivo inicial (obligatorio; puede ser 0)
+// al entrar, si hoy no se abrió la caja, se pide el efectivo inicial (puede ser 0, o se omite por hoy)
 const dlgApertura = $('#dlgApertura');
+// preferencias de este dispositivo (si el navegador no deja guardar, se sigue funcionando igual)
+const local = {
+  get: k => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch {} },
+};
+// las notificaciones del sistema necesitan permiso, y el navegador solo deja pedirlo al tocar un botón
+const pedirPermisoAvisos = () => { if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {}); };
 function abrirApertura(fecha, monto = null, opcional = false) {
   const [y, m, d] = fecha.split('-').map(Number);
   Object.assign(dlgApertura.dataset, { fecha, opcional: opcional ? '1' : '', listo: '' });
   $('#aperturaTitulo').textContent = monto == null ? 'Abrir caja' : 'Corregir apertura';
   $('#aperturaFecha').textContent = new Date(y, m - 1, d).toLocaleDateString('es-AR', { weekday: 'long', day: 'numeric', month: 'long' });
   $('#aperturaCancelar').hidden = !opcional;
+  $('#aperturaOmitir').hidden = opcional; // al entrar se puede omitir; al corregir desde Informes, se cancela
   $('#formApertura').monto.value = monto ?? '';
   flash($('#msgApertura'), '');
   dlgApertura.showModal();
@@ -856,8 +878,15 @@ dlgApertura.oncancel = e => { if (!dlgApertura.dataset.opcional) e.preventDefaul
 // por si el navegador la cierra igual (Escape repetido): se vuelve a abrir hasta que se cargue
 dlgApertura.onclose = () => { if (!dlgApertura.dataset.opcional && !dlgApertura.dataset.listo) dlgApertura.showModal(); };
 $('#aperturaCancelar').onclick = () => dlgApertura.close();
+$('#aperturaOmitir').onclick = () => {
+  local.set('aperturaOmitida', dlgApertura.dataset.fecha);
+  pedirPermisoAvisos();
+  dlgApertura.dataset.listo = '1'; dlgApertura.close();
+  toast('Apertura omitida. Podés cargarla después desde Informes.');
+};
 $('#formApertura').onsubmit = async e => {
   e.preventDefault();
+  pedirPermisoAvisos();
   try {
     await api('POST', '/api/apertura', { fecha: dlgApertura.dataset.fecha, monto: e.target.monto.value });
     dlgApertura.dataset.listo = '1'; dlgApertura.close();
@@ -865,6 +894,7 @@ $('#formApertura').onsubmit = async e => {
   } catch (err) { flash($('#msgApertura'), err.message, true); }
 };
 async function verificarApertura() {
+  if (local.get('aperturaOmitida') === hoy()) return;
   const { monto } = await api('GET', '/api/apertura?fecha=' + hoy());
   if (monto == null && !dlgApertura.open) abrirApertura(hoy());
 }
@@ -883,6 +913,36 @@ function revisarDia() {
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden) revisarDia(); });
 setInterval(revisarDia, 60 * 1000);
+
+// ---------- aviso de cierre de caja ----------
+// desde las 22 hs (o al entrar más tarde) se avisa una vez por día y dispositivo; "más tarde" lo pospone 15 min
+const HORA_CIERRE = 22;
+const dlgCierre = $('#dlgCierre');
+async function revisarCierre() {
+  if (!$('#login').hidden || dlgCierre.open || dlgApertura.open || dlgStock.open) return;
+  if (new Date().getHours() < HORA_CIERRE || local.get('avisoCierre') === hoy() || Date.now() < Number(local.get('cierrePospuesto') || 0)) return;
+  const d = await api('GET', `/api/informe?desde=${hoy()}&hasta=${hoy()}`);
+  const cobrado = m => d.ventas_medio.find(x => x.medio_pago === m)?.total || 0;
+  const pagado = m => d.gastos_medio.find(x => x.medio_pago === m)?.total || 0;
+  const efectivo = (d.apertura || 0) + cobrado('efectivo') - pagado('efectivo');
+  $('#cierreEfectivo').textContent = money(efectivo);
+  $('#cierreTransf').textContent = money(cobrado('transferencia') - pagado('transferencia'));
+  dlgCierre.returnValue = '';
+  dlgCierre.showModal();
+  // si están en otra pestaña o programa, además una notificación del sistema (si dieron permiso)
+  if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
+    const n = new Notification('El Morterito: hora de cerrar la caja', { body: `Tiene que haber ${money(efectivo)} en efectivo.`, icon: '/logo-chico.jpg' });
+    n.onclick = () => { window.focus(); n.close(); };
+  }
+}
+dlgCierre.onclose = () => {
+  if (dlgCierre.returnValue !== 'ver') return local.set('cierrePospuesto', Date.now() + 15 * 60 * 1000); // "más tarde" o Escape
+  local.set('avisoCierre', hoy());
+  periodo = 'dia'; $('#iFecha').value = hoy();
+  document.querySelectorAll('#iPeriodo button').forEach(x => x.classList.toggle('on', x.dataset.p === 'dia'));
+  document.querySelector('nav [data-tab=informes]').click();
+};
+setInterval(() => revisarCierre().catch(() => {}), 60 * 1000);
 
 let pedidoInforme = 0;
 async function verInforme() {
@@ -939,7 +999,7 @@ api('GET', '/api/sesion').then(s => {
     // si falla, avisar en vez de mostrar la lista vacía como si no hubiera productos
     skelTiles(); skelFilas($('#tablaProd'), 8, 5);
     cargarProductos().catch(err => toast('No se pudieron cargar los productos. Recargá la página. ' + err.message, true));
-    verificarApertura().catch(() => {});
+    verificarApertura().catch(() => {}).then(() => revisarCierre()).catch(() => {});
   } else { $('#login').hidden = false; $('#pass').focus(); }
 });
 </script>
