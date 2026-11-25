@@ -59,6 +59,17 @@ CREATE TABLE IF NOT EXISTS usuarios (
   activo INTEGER NOT NULL DEFAULT 1
 );
 -- cierre de caja: lo que se contó y lo que tenía que haber en ese momento
+-- intentos fallidos de contraseña o PIN, para limitarlos (se borran solos después de un día)
+CREATE TABLE IF NOT EXISTS intentos (clave TEXT NOT NULL, ts INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_intentos ON intentos(clave, ts);
+-- registro de lo que se borró (quién, cuándo y qué), para que no se pueda borrar sin dejar rastro
+CREATE TABLE IF NOT EXISTS borrados (
+  id INTEGER PRIMARY KEY,
+  fecha TEXT NOT NULL,
+  creado TEXT NOT NULL,
+  usuario_id INTEGER,
+  detalle TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cierres (
   fecha TEXT PRIMARY KEY,
   contado REAL NOT NULL,
@@ -91,12 +102,15 @@ const one = async (sql, args) => (await all(sql, args))[0];
 class BadRequest extends Error {}
 class Conflict extends BadRequest {} // 409: la pantalla ofrece una alternativa (desactivar)
 class SinUsuario extends BadRequest {} // 403: hay usuarios cargados y nadie ingresó su PIN
+class Demasiados extends BadRequest {} // 429: demasiados intentos fallidos de contraseña o PIN
 const check = (ok, msg) => { if (!ok) throw new BadRequest(msg); };
 const num = (v, campo, min = 0) => {
   const n = Number(v ?? 0);
   check(Number.isFinite(n) && n >= min, `${campo}: valor inválido`);
   return n;
 };
+// texto libre: sin espacios de más y con un largo máximo (que nadie guarde textos enormes)
+const texto = (v, campo, max) => { const s = String(v ?? '').trim(); check(s.length <= max, `${campo}: máximo ${max} caracteres`); return s; };
 // id de ?id=…; uno inválido (texto, vacío) es un 400 claro y no un error de la base
 const idDe = q => { const id = Number(q.get('id')); check(Number.isInteger(id) && id > 0, 'Identificador inválido'); return id; };
 const VENTAS = ['minorista', 'mayorista'];
@@ -112,10 +126,20 @@ const fechaOk = s => {
 // ---------- login ----------
 // Sin APP_PASSWORD (uso local en la PC del negocio) no se pide contraseña.
 const PASSWORD = process.env.APP_PASSWORD || '';
-const SESION = PASSWORD && createHmac('sha256', process.env.SESSION_SECRET || PASSWORD).update('morterito-sesion').digest('hex');
+const SECRETO = process.env.SESSION_SECRET || PASSWORD || 'morterito-local';
 const hash = s => createHash('sha256').update(String(s)).digest();
-const cookieDe = req => /(?:^|;\s*)sesion=([a-f0-9]+)/.exec(req.headers.cookie || '')?.[1];
-const autenticado = req => !PASSWORD || cookieDe(req) === SESION;
+// compara firmas sin filtrar información por el tiempo que tarda
+const igual = (a, b) => typeof a === 'string' && a.length === b.length && timingSafeEqual(Buffer.from(a), Buffer.from(b));
+// sesión del negocio = "momento.firma": vence a los 30 días también del lado del servidor
+// (no alcanza con que el navegador borre la cookie) y cambiar APP_PASSWORD invalida todas
+const DURA_SESION = 30 * 24 * 60 * 60;
+const firmaSesion = t => createHmac('sha256', `${SECRETO}|${PASSWORD}`).update('sesion:' + t).digest('hex');
+const nuevaSesion = () => { const t = Date.now().toString(36); return `${t}.${firmaSesion(t)}`; };
+const autenticado = req => {
+  if (!PASSWORD) return true;
+  const m = /(?:^|;\s*)sesion=([a-z0-9]{1,12})\.([a-f0-9]{64})/.exec(req.headers.cookie || '');
+  return !!m && igual(m[2], firmaSesion(m[1])) && Date.now() - parseInt(m[1], 36) < DURA_SESION * 1000;
+};
 const esperar = ms => new Promise(r => setTimeout(r, ms));
 const ahora = () => new Date().toISOString(); // la hora la pone el servidor, no el reloj de cada dispositivo
 const esHttps = req => req.headers['x-forwarded-proto'] === 'https';
@@ -124,13 +148,31 @@ const cookie = (req, nombre, valor, segundos) =>
 
 // ---------- usuarios: quién está atendiendo ----------
 // La contraseña del negocio abre la app en el dispositivo; el PIN dice quién atiende (cookie firmada, dura un turno).
-const SECRETO = process.env.SESSION_SECRET || PASSWORD || 'morterito-local';
 const TURNO = 14 * 60 * 60; // el PIN se vuelve a pedir al día siguiente
 const firmaUsuario = id => createHmac('sha256', SECRETO).update('usuario:' + id).digest('hex');
 const usuarioCookie = req => {
-  const m = /(?:^|;\s*)usuario=(\d+)\.([a-f0-9]{64})/.exec(req.headers.cookie || '');
-  return m && m[2] === firmaUsuario(m[1]) ? Number(m[1]) : null;
+  const m = /(?:^|;\s*)usuario=(\d{1,9})\.([a-f0-9]{64})/.exec(req.headers.cookie || '');
+  return m && igual(m[2], firmaUsuario(m[1])) ? Number(m[1]) : null;
 };
+
+// ---------- límite de intentos (contraseña del negocio y PINs) ----------
+// Se cuenta en la base (en Vercel no hay memoria compartida entre pedidos): más de 8 fallos
+// desde la misma IP en 15 minutos bloquean ese tipo de intento hasta que pase la ventana.
+const VENTANA_INTENTOS = 15 * 60 * 1000, MAX_FALLOS = 8;
+const ipDe = req => String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'desconocida').split(',')[0].trim();
+async function frenarSiAbusa(req, tipo) {
+  const clave = `${tipo}:${ipDe(req)}`;
+  const { n } = await one('SELECT COUNT(*) AS n FROM intentos WHERE clave = ? AND ts > ?', [clave, Date.now() - VENTANA_INTENTOS]);
+  if (n >= MAX_FALLOS) throw new Demasiados('Demasiados intentos fallidos. Esperá 15 minutos y probá de nuevo.');
+  return clave;
+}
+async function anotarFallo(clave) {
+  if (clave) await db.batch([
+    { sql: 'INSERT INTO intentos (clave, ts) VALUES (?, ?)', args: [clave, Date.now()] },
+    { sql: 'DELETE FROM intentos WHERE ts < ?', args: [Date.now() - 24 * 60 * 60 * 1000] }, // limpieza
+  ], 'write');
+  await esperar(800); // además, cada fallo tarda
+}
 const hashPin = (pin, sal = randomBytes(16).toString('hex')) => `${sal}:${scryptSync(String(pin), sal, 32).toString('hex')}`;
 const pinCoincide = (pin, guardado) => {
   const [sal, h] = guardado.split(':');
@@ -147,14 +189,25 @@ async function quien(req) {
   return null;
 }
 // apertura y cierre de caja se confirman con el PIN de quien los hace (aunque la sesión sea de otra persona)
-async function confirmarConPin(b) {
+async function confirmarConPin(b, req) {
   const activos = await all('SELECT id, pin FROM usuarios WHERE activo = 1');
   if (!activos.length) return null; // sin usuarios cargados no se pide
   const pin = String(b.pin ?? '');
+  check(pin, 'Poné tu PIN para confirmar');
+  const clave = await frenarSiAbusa(req, 'pin');
   const u = /^\d{4,8}$/.test(pin) && activos.find(u => pinCoincide(pin, u.pin));
-  if (!u) { await esperar(800); throw new BadRequest(pin ? 'PIN incorrecto' : 'Poné tu PIN para confirmar'); }
+  if (!u) { await anotarFallo(clave); throw new BadRequest('PIN incorrecto'); }
   return u.id;
 }
+
+// borrar deja rastro: qué era, de qué día, quién lo borró y cuándo
+const plata = n => new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(n);
+const PLURAL = { unidad: 'unidades', paquete: 'paquetes', litro: 'litros' };
+const cuanto = (n, u) => `${new Intl.NumberFormat('es-AR', { maximumFractionDigits: 3 }).format(n)} ${Math.abs(n) === 1 ? u : PLURAL[u] ?? u}`;
+const registroBorrado = (fecha, uid, detalle) =>
+  ({ sql: 'INSERT INTO borrados (fecha, creado, usuario_id, detalle) VALUES (?, ?, ?, ?)', args: [fecha, ahora(), uid, detalle] });
+// shortcut: Argentina es UTC-3 todo el año (sin horario de verano); si el negocio cambia de país, usar Intl con su zona
+const hoyArgentina = () => new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
 // efectivo que tiene que haber en la caja un día: apertura + ventas en efectivo − gastos en efectivo
 async function efectivoEsperado(fecha) {
@@ -170,11 +223,14 @@ const routes = {
 
   'POST /api/login': async (b, _, req, res) => {
     if (!PASSWORD) return { ok: true };
+    // el límite de intentos usa la base; si la base no responde, se puede entrar igual (sin límite)
+    let clave = null;
+    try { await preparar(); clave = await frenarSiAbusa(req, 'login'); } catch (e) { if (e instanceof Demasiados) throw e; }
     if (!timingSafeEqual(hash(b.password), hash(PASSWORD))) {
-      await esperar(800); // frena intentos a ciegas
+      await anotarFallo(clave).catch(() => esperar(800));
       throw new BadRequest('Contraseña incorrecta');
     }
-    res.setHeader('Set-Cookie', cookie(req, 'sesion', SESION, 60 * 60 * 24 * 30));
+    res.setHeader('Set-Cookie', cookie(req, 'sesion', nuevaSesion(), DURA_SESION));
     return { ok: true };
   },
 
@@ -186,8 +242,9 @@ const routes = {
   'GET /api/usuarios': () => all('SELECT id, nombre, activo FROM usuarios ORDER BY activo DESC, nombre'),
 
   // alta, cambio de PIN o baja (activo: false). Pide la contraseña del negocio en "admin".
-  'POST /api/usuarios': async (b) => {
-    if (!esAdmin(b)) { await esperar(800); throw new BadRequest('La contraseña del negocio no es correcta'); }
+  'POST /api/usuarios': async (b, _, req) => {
+    const clave = await frenarSiAbusa(req, 'admin');
+    if (!esAdmin(b)) { await anotarFallo(clave); throw new BadRequest('La contraseña del negocio no es correcta'); }
     const activos = await all('SELECT id, nombre, pin FROM usuarios WHERE activo = 1');
     const pin = String(b.pin ?? '');
     if (pin) {
@@ -206,7 +263,7 @@ const routes = {
       check(r.rowsAffected === 1, 'Usuario inexistente');
       return { id };
     }
-    const nombre = String(b.nombre ?? '').trim();
+    const nombre = texto(b.nombre, 'Nombre', 40);
     check(nombre, 'Falta el nombre');
     check(pin, 'Falta el PIN');
     const r = await db.execute({ sql: 'INSERT INTO usuarios (nombre, pin) VALUES (?, ?)', args: [nombre, hashPin(pin)] });
@@ -215,8 +272,9 @@ const routes = {
 
   'POST /api/usuario/entrar': async (b, _, req, res) => {
     const pin = String(b.pin ?? '');
+    const clave = await frenarSiAbusa(req, 'pin');
     const u = /^\d{4,8}$/.test(pin) && (await all('SELECT id, nombre, pin FROM usuarios WHERE activo = 1')).find(u => pinCoincide(pin, u.pin));
-    if (!u) { await esperar(800); throw new BadRequest('PIN incorrecto'); }
+    if (!u) { await anotarFallo(clave); throw new BadRequest('PIN incorrecto'); }
     res.setHeader('Set-Cookie', cookie(req, 'usuario', `${u.id}.${firmaUsuario(u.id)}`, TURNO));
     return { id: u.id, nombre: u.nombre };
   },
@@ -230,12 +288,12 @@ const routes = {
     all('SELECT * FROM stock ORDER BY activo DESC, nombre'),
 
   'POST /api/productos': async (b) => {
-    const nombre = String(b.nombre ?? '').trim();
+    const nombre = texto(b.nombre, 'Nombre', 80);
     check(nombre, 'Falta el nombre');
     const p = {
       nombre,
-      categoria: String(b.categoria ?? '').trim(),
-      unidad: String(b.unidad ?? 'unidad').trim() || 'unidad',
+      categoria: texto(b.categoria, 'Categoría', 50),
+      unidad: texto(b.unidad ?? 'unidad', 'Unidad', 20) || 'unidad',
       precio_minorista: num(b.precio_minorista, 'Precio minorista'),
       precio_mayorista: num(b.precio_mayorista, 'Precio mayorista'),
       costo: num(b.costo, 'Costo'),
@@ -257,15 +315,18 @@ const routes = {
   },
 
   // borra un producto y sus movimientos de stock; si tiene ventas no, para no alterar informes pasados
-  'DELETE /api/productos': async (_, q) => {
+  'DELETE /api/productos': async (_, q, req) => {
     const id = idDe(q);
+    const p = await one('SELECT nombre FROM productos WHERE id = ?', [id]);
+    check(p, 'Producto no encontrado');
     const { n } = await one(`SELECT COUNT(*) AS n FROM movimientos WHERE producto_id = ? AND tipo IN ('minorista','mayorista')`, [id]);
     if (n) throw new Conflict(`No se puede borrar: tiene ${n} venta(s) registrada(s) y los informes de esos días quedarían mal.`);
-    const [, r] = await db.batch([
+    const uid = await quien(req);
+    await db.batch([
+      registroBorrado(hoyArgentina(), uid, `Producto "${p.nombre}"`),
       { sql: 'DELETE FROM movimientos WHERE producto_id = ?', args: [id] },
       { sql: 'DELETE FROM productos WHERE id = ?', args: [id] },
     ], 'write');
-    check(r.rowsAffected === 1, 'Producto no encontrado');
     return { ok: true };
   },
 
@@ -334,6 +395,8 @@ const routes = {
         LEFT JOIN usuarios u ON u.id = a.usuario_id WHERE a.fecha BETWEEN ? AND ? ORDER BY a.fecha DESC`, r),
       cierres: await all(`SELECT c.fecha, c.contado, c.esperado, c.creado, u.nombre AS usuario FROM cierres c
         LEFT JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha BETWEEN ? AND ? ORDER BY c.fecha DESC`, r),
+      borrados: await all(`SELECT b.fecha, b.creado, b.detalle, u.nombre AS usuario FROM borrados b
+        LEFT JOIN usuarios u ON u.id = b.usuario_id WHERE b.fecha BETWEEN ? AND ? ORDER BY b.creado DESC`, r),
     };
   },
 
@@ -343,9 +406,16 @@ const routes = {
       WHERE m.fecha BETWEEN ? AND ? ORDER BY m.fecha DESC, m.id DESC`,
     [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99']),
 
-  'DELETE /api/movimientos': async (_, q) => {
-    const r = await db.execute({ sql: 'DELETE FROM movimientos WHERE id = ?', args: [idDe(q)] });
-    check(r.rowsAffected === 1, 'Movimiento no encontrado');
+  'DELETE /api/movimientos': async (_, q, req) => {
+    const id = idDe(q);
+    const m = await one(`SELECT m.fecha, m.tipo, m.cantidad, m.precio_unitario, p.nombre, p.unidad FROM movimientos m
+      JOIN productos p ON p.id = m.producto_id WHERE m.id = ?`, [id]);
+    check(m, 'Movimiento no encontrado');
+    const uid = await quien(req);
+    const venta = VENTAS.includes(m.tipo), cant = venta ? -m.cantidad : m.cantidad;
+    const nombres = { minorista: 'Venta minorista', mayorista: 'Venta mayorista', compra: 'Compra', ajuste: 'Ajuste' };
+    const detalle = `${nombres[m.tipo]}: ${m.nombre} x ${cuanto(cant, m.unidad)}${venta ? ` (${plata(cant * m.precio_unitario)})` : ''}`;
+    await db.batch([registroBorrado(m.fecha, uid, detalle), { sql: 'DELETE FROM movimientos WHERE id = ?', args: [id] }], 'write');
     return { ok: true };
   },
 
@@ -362,13 +432,17 @@ const routes = {
     check(MEDIOS.includes(b.medio_pago), 'Elegí con qué se pagó');
     const uid = await quien(req);
     const r = await db.execute({ sql: 'INSERT INTO gastos (fecha, categoria, concepto, monto, medio_pago, usuario_id, creado) VALUES (?,?,?,?,?,?,?)',
-      args: [b.fecha, categoria, String(b.concepto ?? '').trim(), monto, b.medio_pago, uid, ahora()] });
+      args: [b.fecha, categoria, texto(b.concepto, 'Detalle', 150), monto, b.medio_pago, uid, ahora()] });
     return { id: Number(r.lastInsertRowid) };
   },
 
-  'DELETE /api/gastos': async (_, q) => {
-    const r = await db.execute({ sql: 'DELETE FROM gastos WHERE id = ?', args: [idDe(q)] });
-    check(r.rowsAffected === 1, 'Gasto no encontrado');
+  'DELETE /api/gastos': async (_, q, req) => {
+    const id = idDe(q);
+    const g = await one('SELECT fecha, categoria, concepto, monto FROM gastos WHERE id = ?', [id]);
+    check(g, 'Gasto no encontrado');
+    const uid = await quien(req);
+    const detalle = `Gasto: ${g.categoria}${g.concepto ? ` (${g.concepto})` : ''} ${plata(g.monto)}`;
+    await db.batch([registroBorrado(g.fecha, uid, detalle), { sql: 'DELETE FROM gastos WHERE id = ?', args: [id] }], 'write');
     return { ok: true };
   },
 
@@ -383,7 +457,7 @@ const routes = {
     check(fechaOk(b.fecha), 'Fecha inválida');
     check(b.monto !== '' && b.monto != null, 'Poné con cuánto efectivo empezás (puede ser 0)');
     const monto = num(b.monto, 'Monto');
-    const uid = await confirmarConPin(b);
+    const uid = await confirmarConPin(b, req);
     await db.execute({ sql: `INSERT INTO aperturas (fecha, monto, usuario_id, creado) VALUES (?, ?, ?, ?)
         ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto, usuario_id = excluded.usuario_id, creado = excluded.creado`,
       args: [b.fecha, monto, uid, ahora()] });
@@ -395,7 +469,7 @@ const routes = {
     check(fechaOk(b.fecha), 'Fecha inválida');
     check(b.contado !== '' && b.contado != null, 'Poné cuánto efectivo contaste');
     const contado = num(b.contado, 'Efectivo contado');
-    const uid = await confirmarConPin(b);
+    const uid = await confirmarConPin(b, req);
     const esperado = await efectivoEsperado(b.fecha);
     await db.execute({
       sql: `INSERT INTO cierres (fecha, contado, esperado, usuario_id, creado) VALUES (?, ?, ?, ?, ?)
@@ -465,7 +539,7 @@ export async function handler(req, res) {
   // en Vercel la página la sirve public/ directamente; esto es para uso local
   const estatico = { '/': ['index.html', 'text/html; charset=utf-8'], '/logo.jpg': ['logo.jpg', 'image/jpeg'],
     '/logo-chico.jpg': ['logo-chico.jpg', 'image/jpeg'], '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'],
-    '/sw.js': ['sw.js', 'text/javascript'], '/icon-192.png': ['icon-192.png', 'image/png'], '/icon-512.png': ['icon-512.png', 'image/png'] }[url.pathname];
+    '/sw.js': ['sw.js', 'text/javascript'], '/robots.txt': ['robots.txt', 'text/plain'], '/icon-192.png': ['icon-192.png', 'image/png'], '/icon-512.png': ['icon-512.png', 'image/png'] }[url.pathname];
   if (req.method === 'GET' && estatico) {
     res.setHeader('Content-Type', estatico[1]);
     return res.end(readFileSync(join(import.meta.dirname, 'public', estatico[0])));
@@ -481,7 +555,7 @@ export async function handler(req, res) {
     const body = req.method === 'POST' ? await leerBody(req) : {};
     send(200, await route(body, url.searchParams, req, res));
   } catch (e) {
-    if (e instanceof BadRequest) return send(e instanceof Conflict ? 409 : e instanceof SinUsuario ? 403 : 400, { error: e.message });
+    if (e instanceof BadRequest) return send(e instanceof Conflict ? 409 : e instanceof SinUsuario ? 403 : e instanceof Demasiados ? 429 : 400, { error: e.message });
     if (String(e.message).includes('UNIQUE')) return send(400, { error: 'Ya existe uno con ese nombre' });
     console.error(e);
     // solo lo ven usuarios con sesión (los dueños): el detalle sirve para diagnosticar desde una captura

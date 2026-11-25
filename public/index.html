@@ -77,6 +77,7 @@
   tr.bajo td { background: var(--warn-bg); }
   tr.caja td { background: var(--hover); font-weight: 500; } /* aperturas y cierres se distinguen en el historial */
   #tablaMov td:first-child, #tablaGastos td:first-child { white-space: nowrap; } /* fecha y hora en un renglón */
+  tr.borrado td { color: var(--muted); }
   .muted { color: var(--muted); font-size: 13px; }
   .bad { color: var(--warn); }
   .msg { min-height: 22px; margin-top: 8px; }
@@ -269,7 +270,7 @@
     <p class="muted" style="margin:0">Hace falta para agregar, dar de baja o cambiar el PIN de alguien.</p>
     <div id="listaUsuarios"></div>
     <div class="row">
-      <label style="flex:2 1 120px">Nombre<input name="nombre" autocomplete="off"></label>
+      <label style="flex:2 1 120px">Nombre<input name="nombre" autocomplete="off" maxlength="40"></label>
       <label style="flex:1 1 90px">PIN (4 a 8 números)<input name="pin" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="8" autocomplete="new-password"></label>
     </div>
     <button class="primary">Agregar usuario</button>
@@ -385,8 +386,8 @@
       <form id="formProd">
         <input type="hidden" name="id">
         <div class="row">
-          <label style="flex:3 1 220px">Nombre<input name="nombre" required></label>
-          <label style="flex:2 1 140px">Categoría<input name="categoria" list="catlist"></label>
+          <label style="flex:3 1 220px">Nombre<input name="nombre" required maxlength="80"></label>
+          <label style="flex:2 1 140px">Categoría<input name="categoria" list="catlist" maxlength="50"></label>
           <label style="flex:1 1 100px">Unidad
             <select name="unidad"><option>unidad</option><option>kg</option><option>g</option><option>litro</option><option>paquete</option></select>
           </label>
@@ -452,7 +453,7 @@
             <option>Servicios</option><option>Sueldos</option><option>Impuestos</option><option>Marketing</option><option>Otros</option>
           </select>
         </label>
-        <label style="flex:3 1 200px">Detalle<input name="concepto" placeholder="Ej.: Nutryser, bolsitas kraft…"></label>
+        <label style="flex:3 1 200px">Detalle<input name="concepto" maxlength="150" placeholder="Ej.: Nutryser, bolsitas kraft…"></label>
         <label style="flex:1 1 120px">Monto<input name="monto" type="number" step="any" min="0" required></label>
         <label style="flex:1 1 130px">Pagado con
           <select name="medio_pago" required><option value="efectivo">Efectivo</option><option value="transferencia">Transferencia</option></select>
@@ -869,7 +870,12 @@ async function verMovimientos() {
   };
   // de lo más nuevo a lo más viejo, por día y por hora. Lo viejo sin hora: cierre arriba y apertura abajo
   // (el orden se arma así y el sort es estable, así que lo que empata queda como está)
+  // lo borrado no desaparece del todo: queda qué era, quién lo borró y cuándo
+  const cuando = iso => new Date(iso).toLocaleString('es-AR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
+  const filaBorrado = b => `<tr class="borrado"><td>${b.fecha.split('-').reverse().join('/')}</td>
+      <td>Borrado${por(b.usuario)} <span class="muted">· ${cuando(b.creado)}</span></td><td colspan="4"><s>${esc(b.detalle)}</s></td><td></td></tr>`;
   const filas = [
+    ...caja.borrados.map(b => ({ f: b.fecha, k: b.creado, html: filaBorrado(b) })),
     ...caja.cierres.map(c => ({ f: c.fecha, k: c.creado ?? '￿', html: filaCierre(c) })),
     ...rows.map(m => ({ f: m.fecha, k: m.creado ?? '', html: filaMov(m) })),
     ...caja.aperturas.map(a => ({ f: a.fecha, k: a.creado ?? '', html: filaApertura(a) })),

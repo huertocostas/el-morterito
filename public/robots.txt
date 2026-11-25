@@ -1,0 +1,3 @@
+# App privada de un negocio: que los buscadores no la indexen
+User-agent: *
+Disallow: /

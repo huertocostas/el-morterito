@@ -6,6 +6,7 @@ import { rmSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 import { createClient } from '@libsql/client';
+import { createHmac } from 'node:crypto';
 
 const DB = join(tmpdir(), `morterito-test-${Date.now()}.db`), PORT = 3999;
 // base con el esquema de la primera versión (sin costo), como la que ya existe en Turso
@@ -291,12 +292,47 @@ try {
   // lo registrado antes de esta versión no tiene hora (y no rompe nada)
   assert.ok((await api('GET', '/api/movimientos?desde=2026-11-01&hasta=2026-11-01')).data.length >= 0);
 
+  // borrar deja rastro: qué, de qué día, quién y cuándo
+  const gasto8 = (await api('GET', '/api/gastos?desde=2026-11-08&hasta=2026-11-08')).data[0];
+  assert.equal((await api('DELETE', '/api/gastos?id=' + gasto8.id)).status, 200);
+  const venta8 = (await api('GET', '/api/movimientos?desde=2026-11-08&hasta=2026-11-08')).data.find(m => m.tipo === 'minorista');
+  await api('DELETE', '/api/movimientos?id=' + venta8.id);
+  const borr = (await api('GET', '/api/caja?desde=2026-11-08&hasta=2026-11-08')).data.borrados;
+  assert.equal(borr.length, 2);
+  assert.ok(borr.every(b => b.usuario === 'Ana' && reciente(b.creado) && b.fecha === '2026-11-08'));
+  const plata = n => new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(n);
+  assert.ok(borr.some(b => b.detalle === `Gasto: Otros ${plata(3)}`)
+    && borr.some(b => b.detalle === `Venta minorista: ${venta8.nombre} x 1 ${venta8.unidad} (${plata(venta8.precio_unitario)})`), JSON.stringify(borr));
+  // sin identificarse (hay usuarios cargados) no se puede borrar
+  const jarU = jar.get('usuario'); jar.delete('usuario'); cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+  const otro = (await api('GET', '/api/movimientos?desde=2026-11-08&hasta=2026-11-08')).data[0];
+  assert.equal((await api('DELETE', '/api/movimientos?id=' + otro.id)).status, 403);
+  jar.set('usuario', jarU); cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+
+  // textos con largo máximo
+  assert.equal((await api('POST', '/api/productos', { nombre: 'x'.repeat(81), precio_minorista: 1 })).status, 400);
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-08', categoria: 'Otros', monto: 1, medio_pago: 'efectivo', concepto: 'y'.repeat(151) })).status, 400);
+
   // salir de usuario mantiene la sesión del negocio
   await api('POST', '/api/usuario/salir');
   assert.equal((await api('GET', '/api/productos')).status, 200);
 
+  // sesiones: vencen del lado del servidor a los 30 días y no se pueden falsificar
+  const conCookie = c => fetch(`http://127.0.0.1:${PORT}/api/productos`, { headers: { cookie: c } }).then(r => r.status);
+  const firmar = t => createHmac('sha256', 'clave-test|clave-test').update('sesion:' + t).digest('hex'); // misma receta que el servidor
+  const tViejo = (Date.now() - 31 * 24 * 60 * 60 * 1000).toString(36), tNuevo = Date.now().toString(36);
+  assert.equal(await conCookie(`sesion=${tNuevo}.${firmar(tNuevo)}`), 200);
+  assert.equal(await conCookie(`sesion=${tViejo}.${firmar(tViejo)}`), 401, 'sesión vencida');
+  assert.equal(await conCookie(`sesion=${tNuevo}.${'a'.repeat(64)}`), 401, 'firma falsa');
+  assert.equal(await conCookie(`sesion=${createHmac('sha256', 'clave-test').update('morterito-sesion').digest('hex')}`), 401, 'formato viejo');
+
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);
+
+  // límite de intentos: tras 8 contraseñas incorrectas se bloquea (aunque después pongan la correcta)
+  for (let i = 0; i < 8; i++) assert.equal((await api('POST', '/api/login', { password: 'no-' + i })).status, 400);
+  const bloqueado = await api('POST', '/api/login', { password: 'clave-test' });
+  assert.deepEqual([bloqueado.status, /Demasiados intentos/.test(bloqueado.data.error)], [429, true]);
   console.log('OK — todas las pruebas pasaron');
 } finally {
   srv.kill();
