@@ -26,17 +26,23 @@ const srv = spawn(process.execPath, [join(import.meta.dirname, 'server.mjs')],
   { env: { ...process.env, MORTERITO_DB: DB, PORT, APP_PASSWORD: 'clave-test', TURSO_DATABASE_URL: '' } });
 srv.stderr.pipe(process.stderr);
 await new Promise(r => srv.stdout.once('data', r));
+// cookies como un navegador: sesion y usuario por separado; Max-Age=0 las borra
+const jar = new Map();
 let cookie = '';
 const api = async (method, path, body) => {
   const r = await fetch(`http://127.0.0.1:${PORT}${path}`, { method, body: body && JSON.stringify(body), headers: { cookie } });
-  cookie = r.headers.get('set-cookie')?.split(';')[0] ?? cookie;
+  for (const c of r.headers.getSetCookie()) {
+    const [par] = c.split(';'), [k, v] = par.split('=');
+    if (/Max-Age=0/.test(c)) jar.delete(k); else jar.set(k, v);
+  }
+  cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
   return { status: r.status, data: await r.json() };
 };
 
 try {
   // login: sin sesión no se ve nada
   assert.equal((await api('GET', '/api/productos')).status, 401);
-  assert.deepEqual((await api('GET', '/api/sesion')).data, { login: true, ok: false });
+  assert.deepEqual((await api('GET', '/api/sesion')).data, { login: true, ok: false, usuario: null });
   assert.equal((await api('POST', '/api/login', { password: 'otra' })).status, 400);
   assert.equal((await api('GET', '/api/productos')).status, 401);
   assert.equal((await api('POST', '/api/login', { password: 'clave-test' })).status, 200);
@@ -197,6 +203,64 @@ try {
   assert.equal((await api('POST', '/api/stock', { producto_id: 99999, accion: 'entrada', cantidad: 1, fecha: '2026-11-05' })).status, 400);
   const tipos = (await api('GET', '/api/movimientos?desde=2026-11-05&hasta=2026-11-05')).data.map(m => m.tipo);
   assert.ok(tipos.includes('compra') && tipos.includes('ajuste')); // entrada = compra; salida y conté = ajuste
+
+  // cierre de caja con conteo: esperado = apertura + ventas en efectivo − gastos en efectivo
+  // (el 3/11: apertura 2000 + ventas efectivo 400 − gastos efectivo 150 = 2250)
+  const cierre = await api('POST', '/api/cierre', { fecha: '2026-11-03', contado: 2200 });
+  assert.deepEqual(cierre.data, { contado: 2200, esperado: 2250, diferencia: -50 });
+  assert.equal((await api('POST', '/api/cierre', { fecha: '2026-11-03', contado: '' })).status, 400);
+  assert.equal((await api('POST', '/api/cierre', { fecha: '2026-11-03', contado: -1 })).status, 400);
+  assert.deepEqual((await api('POST', '/api/cierre', { fecha: '2026-11-03', contado: 2250 })).data.diferencia, 0); // se corrige
+  const infCierre = (await api('GET', '/api/informe?desde=2026-11-03&hasta=2026-11-03')).data.cierre;
+  assert.deepEqual([infCierre.contado, infCierre.esperado], [2250, 2250]);
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-02&hasta=2026-11-08')).data.cierre, null); // semana: no aplica
+
+  // ---------- usuarios ----------
+  // mientras no haya usuarios, se registra sin PIN (como antes)
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-06', categoria: 'Otros', monto: 1, medio_pago: 'efectivo' })).status, 200);
+  // administrar usuarios pide la contraseña del negocio
+  assert.equal((await api('POST', '/api/usuarios', { admin: 'mal', nombre: 'Ana', pin: '1234' })).status, 400);
+  const { data: { id: ana } } = await api('POST', '/api/usuarios', { admin: 'clave-test', nombre: 'Ana', pin: '1234' });
+  await api('POST', '/api/usuarios', { admin: 'clave-test', nombre: 'Beto', pin: '5678' });
+  assert.equal((await api('POST', '/api/usuarios', { admin: 'clave-test', nombre: 'Caro', pin: '1234' })).status, 400, 'PIN repetido');
+  assert.equal((await api('POST', '/api/usuarios', { admin: 'clave-test', nombre: 'ana', pin: '9999' })).status, 400, 'nombre repetido');
+  assert.equal((await api('POST', '/api/usuarios', { admin: 'clave-test', nombre: 'Dani', pin: '12' })).status, 400, 'PIN corto');
+  const usuarios = (await api('GET', '/api/usuarios')).data;
+  assert.deepEqual(usuarios.map(u => u.nombre), ['Ana', 'Beto']);
+  assert.ok(!('pin' in usuarios[0]), 'el PIN nunca sale del servidor');
+  // con usuarios cargados, registrar algo sin PIN da 403 (la pantalla pide el PIN)
+  const sinPin = await api('POST', '/api/gastos', { fecha: '2026-11-06', categoria: 'Otros', monto: 1, medio_pago: 'efectivo' });
+  assert.equal(sinPin.status, 403);
+  assert.equal((await api('POST', '/api/usuario/entrar', { pin: '0000' })).status, 400);
+  assert.deepEqual((await api('POST', '/api/usuario/entrar', { pin: '1234' })).data, { id: ana, nombre: 'Ana' });
+  assert.equal((await api('GET', '/api/sesion')).data.usuario, ana);
+  // lo que registra queda a su nombre
+  await api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-07', items: [{ producto_id: yerba, cantidad: 1, precio_unitario: 100 }] });
+  await api('POST', '/api/gastos', { fecha: '2026-11-07', categoria: 'Otros', monto: 7, medio_pago: 'efectivo' });
+  await api('POST', '/api/stock', { producto_id: yerba, accion: 'entrada', cantidad: 3, fecha: '2026-11-07' });
+  const movs7 = (await api('GET', '/api/movimientos?desde=2026-11-07&hasta=2026-11-07')).data;
+  assert.ok(movs7.length >= 2 && movs7.every(m => m.usuario === 'Ana'));
+  assert.equal((await api('GET', '/api/gastos?desde=2026-11-07&hasta=2026-11-07')).data[0].usuario, 'Ana');
+  assert.deepEqual((await api('GET', '/api/informe?desde=2026-11-07&hasta=2026-11-07')).data.por_usuario.map(x => [x.usuario, x.total]), [['Ana', 100]]);
+  // cambiar de persona
+  await api('POST', '/api/usuario/entrar', { pin: '5678' });
+  await api('POST', '/api/cierre', { fecha: '2026-11-07', contado: 0 });
+  assert.equal((await api('GET', '/api/informe?desde=2026-11-07&hasta=2026-11-07')).data.cierre.usuario, 'Beto');
+  // baja: Beto ya no puede registrar con su cookie ni volver a entrar; su PIN queda libre
+  const beto = usuarios.find(u => u.nombre === 'Beto').id;
+  assert.equal((await api('POST', '/api/usuarios', { admin: 'clave-test', id: beto, activo: false })).status, 200);
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-07', categoria: 'Otros', monto: 1, medio_pago: 'efectivo' })).status, 403);
+  assert.equal((await api('POST', '/api/usuario/entrar', { pin: '5678' })).status, 400);
+  // cambiar el PIN de Ana
+  await api('POST', '/api/usuarios', { admin: 'clave-test', id: ana, pin: '4321' });
+  assert.equal((await api('POST', '/api/usuario/entrar', { pin: '1234' })).status, 400);
+  assert.equal((await api('POST', '/api/usuario/entrar', { pin: '4321' })).status, 200);
+  // una cookie de usuario falsificada no sirve
+  jar.set('usuario', `${ana}.${'0'.repeat(64)}`); cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+  assert.equal((await api('GET', '/api/sesion')).data.usuario, null);
+  // salir de usuario mantiene la sesión del negocio
+  await api('POST', '/api/usuario/salir');
+  assert.equal((await api('GET', '/api/productos')).status, 200);
 
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);

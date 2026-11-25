@@ -23,3 +23,5 @@ node_modules/
 .claude/
 # informes de revisión (no van al repo)
 informe-el-morterito.md
+!public/icon-192.png
+!public/icon-512.png

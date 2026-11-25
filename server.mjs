@@ -4,7 +4,7 @@ import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual, scryptSync, randomBytes } from 'node:crypto';
 import { createClient } from '@libsql/client';
 
 const db = createClient({
@@ -51,12 +51,29 @@ CREATE TABLE IF NOT EXISTS aperturas (
   fecha TEXT PRIMARY KEY,
   monto REAL NOT NULL
 );
+-- quién atiende: cada persona entra con su PIN (guardado con sal y scrypt, nunca en texto)
+CREATE TABLE IF NOT EXISTS usuarios (
+  id INTEGER PRIMARY KEY,
+  nombre TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  pin TEXT NOT NULL,
+  activo INTEGER NOT NULL DEFAULT 1
+);
+-- cierre de caja: lo que se contó y lo que tenía que haber en ese momento
+CREATE TABLE IF NOT EXISTS cierres (
+  fecha TEXT PRIMARY KEY,
+  contado REAL NOT NULL,
+  esperado REAL NOT NULL,
+  usuario_id INTEGER
+);
 `);
   // columnas agregadas después de la primera versión (la base de Turso ya existe)
   for (const sql of ['ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0',
     'ALTER TABLE movimientos ADD COLUMN costo_unitario REAL NOT NULL DEFAULT 0',
     "ALTER TABLE movimientos ADD COLUMN medio_pago TEXT NOT NULL DEFAULT ''", // ventas viejas quedan sin dato
-    "ALTER TABLE gastos ADD COLUMN medio_pago TEXT NOT NULL DEFAULT 'efectivo'"]) {
+    "ALTER TABLE gastos ADD COLUMN medio_pago TEXT NOT NULL DEFAULT 'efectivo'",
+    'ALTER TABLE movimientos ADD COLUMN usuario_id INTEGER', // quién lo hizo (null = antes de haber usuarios)
+    'ALTER TABLE gastos ADD COLUMN usuario_id INTEGER',
+    'ALTER TABLE aperturas ADD COLUMN usuario_id INTEGER']) {
     try { await db.execute(sql); } catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
   }
 }
@@ -70,6 +87,7 @@ const one = async (sql, args) => (await all(sql, args))[0];
 
 class BadRequest extends Error {}
 class Conflict extends BadRequest {} // 409: la pantalla ofrece una alternativa (desactivar)
+class SinUsuario extends BadRequest {} // 403: hay usuarios cargados y nadie ingresó su PIN
 const check = (ok, msg) => { if (!ok) throw new BadRequest(msg); };
 const num = (v, campo, min = 0) => {
   const n = Number(v ?? 0);
@@ -95,23 +113,103 @@ const SESION = PASSWORD && createHmac('sha256', process.env.SESSION_SECRET || PA
 const hash = s => createHash('sha256').update(String(s)).digest();
 const cookieDe = req => /(?:^|;\s*)sesion=([a-f0-9]+)/.exec(req.headers.cookie || '')?.[1];
 const autenticado = req => !PASSWORD || cookieDe(req) === SESION;
+const esperar = ms => new Promise(r => setTimeout(r, ms));
+const esHttps = req => req.headers['x-forwarded-proto'] === 'https';
+const cookie = (req, nombre, valor, segundos) =>
+  `${nombre}=${valor}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${segundos}${esHttps(req) ? '; Secure' : ''}`;
+
+// ---------- usuarios: quién está atendiendo ----------
+// La contraseña del negocio abre la app en el dispositivo; el PIN dice quién atiende (cookie firmada, dura un turno).
+const SECRETO = process.env.SESSION_SECRET || PASSWORD || 'morterito-local';
+const TURNO = 14 * 60 * 60; // el PIN se vuelve a pedir al día siguiente
+const firmaUsuario = id => createHmac('sha256', SECRETO).update('usuario:' + id).digest('hex');
+const usuarioCookie = req => {
+  const m = /(?:^|;\s*)usuario=(\d+)\.([a-f0-9]{64})/.exec(req.headers.cookie || '');
+  return m && m[2] === firmaUsuario(m[1]) ? Number(m[1]) : null;
+};
+const hashPin = (pin, sal = randomBytes(16).toString('hex')) => `${sal}:${scryptSync(String(pin), sal, 32).toString('hex')}`;
+const pinCoincide = (pin, guardado) => {
+  const [sal, h] = guardado.split(':');
+  return timingSafeEqual(Buffer.from(h, 'hex'), scryptSync(String(pin), sal, 32));
+};
+// para administrar usuarios hay que volver a escribir la contraseña del negocio
+const esAdmin = b => !PASSWORD || timingSafeEqual(hash(b.admin ?? ''), hash(PASSWORD));
+// id de quien atiende; si hay usuarios cargados es obligatorio para registrar algo
+async function quien(req) {
+  const id = usuarioCookie(req);
+  const u = id && await one('SELECT id FROM usuarios WHERE id = ? AND activo = 1', [id]);
+  if (u) return u.id;
+  if (await one('SELECT 1 AS hay FROM usuarios WHERE activo = 1 LIMIT 1')) throw new SinUsuario('Ingresá tu PIN para registrar quién atiende');
+  return null;
+}
+
+// efectivo que tiene que haber en la caja un día: apertura + ventas en efectivo − gastos en efectivo
+async function efectivoEsperado(fecha) {
+  const r = await one(`SELECT
+      COALESCE((SELECT monto FROM aperturas WHERE fecha = :f), 0)
+    + COALESCE((SELECT SUM(-cantidad * precio_unitario) FROM movimientos WHERE fecha = :f AND tipo IN ('minorista','mayorista') AND medio_pago = 'efectivo'), 0)
+    - COALESCE((SELECT SUM(monto) FROM gastos WHERE fecha = :f AND medio_pago = 'efectivo'), 0) AS esperado`, { f: fecha });
+  return Math.round(r.esperado * 100) / 100;
+}
 
 const routes = {
-  'GET /api/sesion': (_, __, req) => ({ login: !!PASSWORD, ok: autenticado(req) }),
+  'GET /api/sesion': (_, __, req) => ({ login: !!PASSWORD, ok: autenticado(req), usuario: usuarioCookie(req) }),
 
   'POST /api/login': async (b, _, req, res) => {
     if (!PASSWORD) return { ok: true };
     if (!timingSafeEqual(hash(b.password), hash(PASSWORD))) {
-      await new Promise(r => setTimeout(r, 800)); // frena intentos a ciegas
+      await esperar(800); // frena intentos a ciegas
       throw new BadRequest('Contraseña incorrecta');
     }
-    const https = req.headers['x-forwarded-proto'] === 'https';
-    res.setHeader('Set-Cookie', `sesion=${SESION}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}${https ? '; Secure' : ''}`);
+    res.setHeader('Set-Cookie', cookie(req, 'sesion', SESION, 60 * 60 * 24 * 30));
     return { ok: true };
   },
 
-  'POST /api/logout': (_, __, ___, res) => {
-    res.setHeader('Set-Cookie', 'sesion=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+  'POST /api/logout': (_, __, req, res) => {
+    res.setHeader('Set-Cookie', [cookie(req, 'sesion', '', 0), cookie(req, 'usuario', '', 0)]);
+    return { ok: true };
+  },
+
+  'GET /api/usuarios': () => all('SELECT id, nombre, activo FROM usuarios ORDER BY activo DESC, nombre'),
+
+  // alta, cambio de PIN o baja (activo: false). Pide la contraseña del negocio en "admin".
+  'POST /api/usuarios': async (b) => {
+    if (!esAdmin(b)) { await esperar(800); throw new BadRequest('La contraseña del negocio no es correcta'); }
+    const activos = await all('SELECT id, nombre, pin FROM usuarios WHERE activo = 1');
+    const pin = String(b.pin ?? '');
+    if (pin) {
+      check(/^\d{4,8}$/.test(pin), 'El PIN tiene que ser de 4 a 8 números');
+      // el PIN identifica a la persona: no puede repetirse entre usuarios activos
+      check(!activos.some(u => u.id !== Number(b.id) && pinCoincide(pin, u.pin)), 'Ese PIN ya lo usa otra persona');
+    }
+    if (b.id) {
+      const id = Number(b.id);
+      check(Number.isInteger(id) && id > 0, 'Usuario inexistente');
+      const sets = [], args = [];
+      if (pin) { sets.push('pin = ?'); args.push(hashPin(pin)); }
+      if (b.activo !== undefined) { sets.push('activo = ?'); args.push(b.activo ? 1 : 0); }
+      check(sets.length, 'No hay nada para cambiar');
+      const r = await db.execute({ sql: `UPDATE usuarios SET ${sets.join(', ')} WHERE id = ?`, args: [...args, id] });
+      check(r.rowsAffected === 1, 'Usuario inexistente');
+      return { id };
+    }
+    const nombre = String(b.nombre ?? '').trim();
+    check(nombre, 'Falta el nombre');
+    check(pin, 'Falta el PIN');
+    const r = await db.execute({ sql: 'INSERT INTO usuarios (nombre, pin) VALUES (?, ?)', args: [nombre, hashPin(pin)] });
+    return { id: Number(r.lastInsertRowid) };
+  },
+
+  'POST /api/usuario/entrar': async (b, _, req, res) => {
+    const pin = String(b.pin ?? '');
+    const u = /^\d{4,8}$/.test(pin) && (await all('SELECT id, nombre, pin FROM usuarios WHERE activo = 1')).find(u => pinCoincide(pin, u.pin));
+    if (!u) { await esperar(800); throw new BadRequest('PIN incorrecto'); }
+    res.setHeader('Set-Cookie', cookie(req, 'usuario', `${u.id}.${firmaUsuario(u.id)}`, TURNO));
+    return { id: u.id, nombre: u.nombre };
+  },
+
+  'POST /api/usuario/salir': (_, __, req, res) => {
+    res.setHeader('Set-Cookie', cookie(req, 'usuario', '', 0));
     return { ok: true };
   },
 
@@ -159,12 +257,13 @@ const routes = {
   },
 
   // { tipo, fecha, medio_pago, items: [{ producto_id, cantidad, precio_unitario }] }
-  'POST /api/movimientos': async (b) => {
+  'POST /api/movimientos': async (b, _, req) => {
     check(['minorista', 'mayorista', 'compra', 'ajuste'].includes(b.tipo), 'Tipo inválido');
     check(fechaOk(b.fecha), 'Fecha inválida');
     check(Array.isArray(b.items) && b.items.length, 'No hay productos cargados');
     check(b.items.every(it => it && typeof it === 'object'), 'Producto inexistente');
     const venta = VENTAS.includes(b.tipo);
+    const uid = await quien(req);
     check(!venta || MEDIOS.includes(b.medio_pago), 'Elegí el medio de pago');
     const ids = [...new Set(b.items.map(it => Number(it.producto_id)))];
     check(ids.every(Number.isInteger), 'Producto inexistente');
@@ -182,9 +281,9 @@ const routes = {
       const precio = num(it.precio_unitario, 'Precio');
       check(!venta || precio > 0, 'Hay un producto con precio $0: cargale el precio antes de cobrar');
       return {
-        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago) VALUES (?,?,?,?,?,?,?)',
+        sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago, usuario_id) VALUES (?,?,?,?,?,?,?,?)',
         args: [b.fecha, b.tipo, Number(it.producto_id), venta ? -cant : cant, precio,
-          costo[Number(it.producto_id)], venta ? b.medio_pago : ''],
+          costo[Number(it.producto_id)], venta ? b.medio_pago : '', uid],
       };
     });
     await db.batch(stmts, 'write');
@@ -192,11 +291,12 @@ const routes = {
   },
 
   // sección Stock: entró mercadería, salió (rotura, vencido, consumo) o "conté y hay X"
-  'POST /api/stock': async (b) => {
+  'POST /api/stock': async (b, _, req) => {
     check(['entrada', 'salida', 'contar'].includes(b.accion), 'Acción inválida');
     check(fechaOk(b.fecha), 'Fecha inválida');
     const id = Number(b.producto_id);
     check(Number.isInteger(id) && id > 0, 'Producto inexistente');
+    const uid = await quien(req);
     const p = await one('SELECT costo, stock FROM stock WHERE id = ?', [id]);
     check(p, 'Producto inexistente');
     check(b.cantidad !== '' && b.cantidad != null, 'Poné la cantidad');
@@ -206,14 +306,15 @@ const routes = {
     const mov = b.accion === 'entrada' ? cant : b.accion === 'salida' ? -cant : Math.round((cant - p.stock) * 1000) / 1000;
     if (mov === 0) return { ok: true, movimiento: 0 };
     await db.execute({
-      sql: "INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago) VALUES (?,?,?,?,0,?,'')",
-      args: [b.fecha, b.accion === 'entrada' ? 'compra' : 'ajuste', id, mov, p.costo],
+      sql: "INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago, usuario_id) VALUES (?,?,?,?,0,?,'',?)",
+      args: [b.fecha, b.accion === 'entrada' ? 'compra' : 'ajuste', id, mov, p.costo, uid],
     });
     return { ok: true, movimiento: mov };
   },
 
   'GET /api/movimientos': (_, q) =>
-    all(`SELECT m.*, p.nombre, p.unidad FROM movimientos m JOIN productos p ON p.id = m.producto_id
+    all(`SELECT m.*, p.nombre, p.unidad, u.nombre AS usuario FROM movimientos m JOIN productos p ON p.id = m.producto_id
+      LEFT JOIN usuarios u ON u.id = m.usuario_id
       WHERE m.fecha BETWEEN ? AND ? ORDER BY m.fecha DESC, m.id DESC`,
     [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99']),
 
@@ -224,18 +325,19 @@ const routes = {
   },
 
   'GET /api/gastos': (_, q) =>
-    all('SELECT * FROM gastos WHERE fecha BETWEEN ? AND ? ORDER BY fecha DESC, id DESC',
+    all('SELECT g.*, u.nombre AS usuario FROM gastos g LEFT JOIN usuarios u ON u.id = g.usuario_id WHERE g.fecha BETWEEN ? AND ? ORDER BY g.fecha DESC, g.id DESC',
       [q.get('desde') || '0000-00-00', q.get('hasta') || '9999-99-99']),
 
-  'POST /api/gastos': async (b) => {
+  'POST /api/gastos': async (b, _, req) => {
     check(fechaOk(b.fecha), 'Fecha inválida');
     const categoria = String(b.categoria ?? '').trim();
     check(CATEGORIAS_GASTO.includes(categoria), 'Elegí una categoría de la lista');
     const monto = num(b.monto, 'Monto');
     check(monto > 0, 'El monto tiene que ser mayor a 0');
     check(MEDIOS.includes(b.medio_pago), 'Elegí con qué se pagó');
-    const r = await db.execute({ sql: 'INSERT INTO gastos (fecha, categoria, concepto, monto, medio_pago) VALUES (?,?,?,?,?)',
-      args: [b.fecha, categoria, String(b.concepto ?? '').trim(), monto, b.medio_pago] });
+    const uid = await quien(req);
+    const r = await db.execute({ sql: 'INSERT INTO gastos (fecha, categoria, concepto, monto, medio_pago, usuario_id) VALUES (?,?,?,?,?,?)',
+      args: [b.fecha, categoria, String(b.concepto ?? '').trim(), monto, b.medio_pago, uid] });
     return { id: Number(r.lastInsertRowid) };
   },
 
@@ -252,13 +354,29 @@ const routes = {
   },
 
   // se puede volver a mandar para corregir el monto del día
-  'POST /api/apertura': async (b) => {
+  'POST /api/apertura': async (b, _, req) => {
     check(fechaOk(b.fecha), 'Fecha inválida');
     check(b.monto !== '' && b.monto != null, 'Poné con cuánto efectivo empezás (puede ser 0)');
     const monto = num(b.monto, 'Monto');
-    await db.execute({ sql: 'INSERT INTO aperturas (fecha, monto) VALUES (?, ?) ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto',
-      args: [b.fecha, monto] });
+    const uid = await quien(req);
+    await db.execute({ sql: 'INSERT INTO aperturas (fecha, monto, usuario_id) VALUES (?, ?, ?) ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto, usuario_id = excluded.usuario_id',
+      args: [b.fecha, monto, uid] });
     return { ok: true };
+  },
+
+  // cerrar la caja: se guarda lo contado y lo que tenía que haber (calculado acá, en este momento)
+  'POST /api/cierre': async (b, _, req) => {
+    check(fechaOk(b.fecha), 'Fecha inválida');
+    check(b.contado !== '' && b.contado != null, 'Poné cuánto efectivo contaste');
+    const contado = num(b.contado, 'Efectivo contado');
+    const uid = await quien(req);
+    const esperado = await efectivoEsperado(b.fecha);
+    await db.execute({
+      sql: `INSERT INTO cierres (fecha, contado, esperado, usuario_id) VALUES (?, ?, ?, ?)
+        ON CONFLICT(fecha) DO UPDATE SET contado = excluded.contado, esperado = excluded.esperado, usuario_id = excluded.usuario_id`,
+      args: [b.fecha, contado, esperado, uid],
+    });
+    return { contado, esperado, diferencia: Math.round((contado - esperado) * 100) / 100 };
   },
 
   // informe de un período (día, semana o mes): ?desde=AAAA-MM-DD&hasta=AAAA-MM-DD
@@ -268,6 +386,12 @@ const routes = {
     return {
       // solo en el informe de un día: la caja se cuenta día por día
       apertura: rango[0] === rango[1] ? (await one('SELECT monto FROM aperturas WHERE fecha = ?', [rango[0]]))?.monto ?? null : null,
+      cierre: rango[0] === rango[1] ? (await one(`SELECT c.contado, c.esperado, u.nombre AS usuario FROM cierres c
+        LEFT JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha = ?`, [rango[0]])) ?? null : null,
+      // cuánto vendió cada persona (null = ventas de antes de haber usuarios)
+      por_usuario: await all(`SELECT u.nombre AS usuario, COUNT(DISTINCT m.id) AS lineas, SUM(-m.cantidad * m.precio_unitario) AS total
+        FROM movimientos m LEFT JOIN usuarios u ON u.id = m.usuario_id
+        WHERE m.fecha BETWEEN ? AND ? AND m.tipo IN ('minorista','mayorista') GROUP BY m.usuario_id ORDER BY total DESC`, rango),
       // ganancia = (precio - costo al momento de la venta) x cantidad
       ventas: await all(`SELECT tipo, COUNT(*) AS lineas, SUM(-cantidad * precio_unitario) AS total,
           SUM(-cantidad * (precio_unitario - costo_unitario)) AS ganancia,
@@ -314,7 +438,8 @@ export async function handler(req, res) {
   };
   // en Vercel la página la sirve public/ directamente; esto es para uso local
   const estatico = { '/': ['index.html', 'text/html; charset=utf-8'], '/logo.jpg': ['logo.jpg', 'image/jpeg'],
-    '/logo-chico.jpg': ['logo-chico.jpg', 'image/jpeg'] }[url.pathname];
+    '/logo-chico.jpg': ['logo-chico.jpg', 'image/jpeg'], '/manifest.webmanifest': ['manifest.webmanifest', 'application/manifest+json'],
+    '/sw.js': ['sw.js', 'text/javascript'], '/icon-192.png': ['icon-192.png', 'image/png'], '/icon-512.png': ['icon-512.png', 'image/png'] }[url.pathname];
   if (req.method === 'GET' && estatico) {
     res.setHeader('Content-Type', estatico[1]);
     return res.end(readFileSync(join(import.meta.dirname, 'public', estatico[0])));
@@ -330,8 +455,8 @@ export async function handler(req, res) {
     const body = req.method === 'POST' ? await leerBody(req) : {};
     send(200, await route(body, url.searchParams, req, res));
   } catch (e) {
-    if (e instanceof BadRequest) return send(e instanceof Conflict ? 409 : 400, { error: e.message });
-    if (String(e.message).includes('UNIQUE')) return send(400, { error: 'Ya existe un producto con ese nombre' });
+    if (e instanceof BadRequest) return send(e instanceof Conflict ? 409 : e instanceof SinUsuario ? 403 : 400, { error: e.message });
+    if (String(e.message).includes('UNIQUE')) return send(400, { error: 'Ya existe uno con ese nombre' });
     console.error(e);
     // solo lo ven usuarios con sesión (los dueños): el detalle sirve para diagnosticar desde una captura
     send(500, { error: `No se pudo completar, probá de nuevo en unos segundos. (Detalle: ${e.message})` });
