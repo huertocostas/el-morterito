@@ -104,9 +104,11 @@ class Conflict extends BadRequest {} // 409: la pantalla ofrece una alternativa 
 class SinUsuario extends BadRequest {} // 403: hay usuarios cargados y nadie ingresó su PIN
 class Demasiados extends BadRequest {} // 429: demasiados intentos fallidos de contraseña o PIN
 const check = (ok, msg) => { if (!ok) throw new BadRequest(msg); };
-const num = (v, campo, min = 0) => {
+// número con mínimo y máximo: sin tope, un 1e308 se guardaba y dejaba totales infinitos o ilegibles
+const MAX_PLATA = 1e9, MAX_CANTIDAD = 1e6; // $1.000 millones por operación; un millón de unidades o kg
+const num = (v, campo, min = 0, max = MAX_PLATA) => {
   const n = Number(v ?? 0);
-  check(Number.isFinite(n) && n >= min, `${campo}: valor inválido`);
+  check(Number.isFinite(n) && n >= min && n <= max, `${campo}: valor inválido`);
   return n;
 };
 // texto libre: sin espacios de más y con un largo máximo (que nadie guarde textos enormes)
@@ -149,10 +151,12 @@ const cookie = (req, nombre, valor, segundos) =>
 // ---------- usuarios: quién está atendiendo ----------
 // La contraseña del negocio abre la app en el dispositivo; el PIN dice quién atiende (cookie firmada, dura un turno).
 const TURNO = 14 * 60 * 60; // el PIN se vuelve a pedir al día siguiente
-const firmaUsuario = id => createHmac('sha256', SECRETO).update('usuario:' + id).digest('hex');
+// "id.momento.firma": el turno vence a las 14 h también en el servidor (no solo en el navegador)
+const firmaUsuario = (id, t) => createHmac('sha256', SECRETO).update(`usuario:${id}:${t}`).digest('hex');
+const nuevoTurno = id => { const t = Date.now().toString(36); return `${id}.${t}.${firmaUsuario(id, t)}`; };
 const usuarioCookie = req => {
-  const m = /(?:^|;\s*)usuario=(\d{1,9})\.([a-f0-9]{64})/.exec(req.headers.cookie || '');
-  return m && igual(m[2], firmaUsuario(m[1])) ? Number(m[1]) : null;
+  const m = /(?:^|;\s*)usuario=(\d{1,9})\.([a-z0-9]{1,12})\.([a-f0-9]{64})/.exec(req.headers.cookie || '');
+  return m && igual(m[3], firmaUsuario(m[1], m[2])) && Date.now() - parseInt(m[2], 36) < TURNO * 1000 ? Number(m[1]) : null;
 };
 
 // ---------- límite de intentos (contraseña del negocio y PINs) ----------
@@ -160,8 +164,11 @@ const usuarioCookie = req => {
 // desde la misma IP en 15 minutos bloquean ese tipo de intento hasta que pase la ventana.
 const VENTANA_INTENTOS = 15 * 60 * 1000, MAX_FALLOS = 8;
 const ipDe = req => String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'desconocida').split(',')[0].trim();
+// PIN y administración solo se usan en un dispositivo que ya entró con la contraseña del negocio: se cuentan
+// por dispositivo (su sesión), así un dueño que se equivoca no bloquea al otro en el mismo wifi del local
+const dispositivoDe = req => /(?:^|;\s*)sesion=([a-z0-9]{1,12})\./.exec(req.headers.cookie || '')?.[1];
 async function frenarSiAbusa(req, tipo) {
-  const clave = `${tipo}:${ipDe(req)}`;
+  const clave = `${tipo}:${(tipo !== 'login' && dispositivoDe(req)) || ipDe(req)}`;
   const { n } = await one('SELECT COUNT(*) AS n FROM intentos WHERE clave = ? AND ts > ?', [clave, Date.now() - VENTANA_INTENTOS]);
   if (n >= MAX_FALLOS) throw new Demasiados('Demasiados intentos fallidos. Esperá 15 minutos y probá de nuevo.');
   return clave;
@@ -256,6 +263,10 @@ const routes = {
     if (b.id) {
       const id = Number(b.id);
       check(Number.isInteger(id) && id > 0, 'Usuario inexistente');
+      const actual = await one('SELECT activo FROM usuarios WHERE id = ?', [id]);
+      check(actual, 'Usuario inexistente');
+      // al reactivar, su PIN viejo puede estar usándolo otra persona (y no se puede saber: está cifrado)
+      check(!(b.activo && !actual.activo && !pin), 'Para volver a activarlo, poné un PIN nuevo');
       const sets = [], args = [];
       if (pin) { sets.push('pin = ?'); args.push(hashPin(pin)); }
       if (b.activo !== undefined) { sets.push('activo = ?'); args.push(b.activo ? 1 : 0); }
@@ -267,6 +278,14 @@ const routes = {
     const nombre = texto(b.nombre, 'Nombre', 40);
     check(nombre, 'Falta el nombre');
     check(pin, 'Falta el PIN');
+    // mismo nombre (sin importar mayúsculas ni tildes): si estaba dado de baja, vuelve con el PIN nuevo
+    const comparable = nombre.toLocaleLowerCase('es');
+    const mismo = (await all('SELECT id, nombre, activo FROM usuarios')).find(u => u.nombre.toLocaleLowerCase('es') === comparable);
+    check(!mismo?.activo, 'Ya hay un usuario con ese nombre');
+    if (mismo) {
+      await db.execute({ sql: 'UPDATE usuarios SET pin = ?, activo = 1 WHERE id = ?', args: [hashPin(pin), mismo.id] });
+      return { id: mismo.id, reactivado: true };
+    }
     const r = await db.execute({ sql: 'INSERT INTO usuarios (nombre, pin) VALUES (?, ?)', args: [nombre, hashPin(pin)] });
     return { id: Number(r.lastInsertRowid) };
   },
@@ -276,7 +295,7 @@ const routes = {
     const clave = await frenarSiAbusa(req, 'pin');
     const u = /^\d{4,8}$/.test(pin) && (await all('SELECT id, nombre, pin FROM usuarios WHERE activo = 1')).find(u => pinCoincide(pin, u.pin));
     if (!u) { await anotarFallo(clave); throw new BadRequest('PIN incorrecto'); }
-    res.setHeader('Set-Cookie', cookie(req, 'usuario', `${u.id}.${firmaUsuario(u.id)}`, TURNO));
+    res.setHeader('Set-Cookie', cookie(req, 'usuario', nuevoTurno(u.id), TURNO));
     return { id: u.id, nombre: u.nombre };
   },
 
@@ -298,7 +317,7 @@ const routes = {
       precio_minorista: num(b.precio_minorista, 'Precio minorista'),
       precio_mayorista: num(b.precio_mayorista, 'Precio mayorista'),
       costo: num(b.costo, 'Costo'),
-      stock_minimo: num(b.stock_minimo, 'Stock mínimo'),
+      stock_minimo: num(b.stock_minimo, 'Stock mínimo', 0, MAX_CANTIDAD),
       activo: b.activo === false || b.activo === 0 ? 0 : 1,
     };
     // COLLATE NOCASE de SQLite no iguala acentos en mayúscula (Á/á), así que se controla acá
@@ -337,6 +356,7 @@ const routes = {
     check(fechaOk(b.fecha), 'Fecha inválida');
     check(Array.isArray(b.items) && b.items.length, 'No hay productos cargados');
     check(b.items.every(it => it && typeof it === 'object'), 'Producto inexistente');
+    check(b.items.length <= 200, 'Demasiados productos en un solo ticket (máximo 200)');
     const venta = VENTAS.includes(b.tipo);
     const uid = await quien(req);
     check(!venta || MEDIOS.includes(b.medio_pago), 'Elegí el medio de pago');
@@ -353,7 +373,7 @@ const routes = {
     const creado = ahora();
     const stmts = b.items.map(it => {
       // En ajustes la cantidad viene con signo (+ sobrante, - faltante); en el resto, positiva.
-      const cant = b.tipo === 'ajuste' ? num(it.cantidad, 'Cantidad', -Infinity) : num(it.cantidad, 'Cantidad');
+      const cant = b.tipo === 'ajuste' ? num(it.cantidad, 'Cantidad', -MAX_CANTIDAD, MAX_CANTIDAD) : num(it.cantidad, 'Cantidad', 0, MAX_CANTIDAD);
       check(cant !== 0, 'La cantidad no puede ser 0');
       const precio = num(it.precio_unitario, 'Precio');
       check(!venta || precio > 0, 'Hay un producto con precio $0: cargale el precio antes de cobrar');
@@ -381,7 +401,7 @@ const routes = {
     const p = await one('SELECT costo, stock FROM stock WHERE id = ?', [id]);
     check(p, 'Producto inexistente');
     check(b.cantidad !== '' && b.cantidad != null, 'Poné la cantidad');
-    const cant = num(b.cantidad, 'Cantidad');
+    const cant = num(b.cantidad, 'Cantidad', 0, MAX_CANTIDAD);
     check(b.accion === 'contar' || cant > 0, 'La cantidad tiene que ser mayor a 0');
     // al contar, la diferencia se calcula contra el stock de este momento (no el que tenía la pantalla)
     const mov = b.accion === 'entrada' ? cant : b.accion === 'salida' ? -cant : Math.round((cant - p.stock) * 1000) / 1000;
@@ -527,12 +547,17 @@ async function leerBody(req) {
   let raw;
   try { raw = req.body; } catch { throw new BadRequest('JSON inválido'); } // en Vercel ya viene leído (y tira si no es JSON)
   if (raw === undefined) {
-    raw = '';
-    for await (const chunk of req) { raw += chunk; if (raw.length > 1e6) throw new BadRequest('Pedido demasiado grande'); }
+    // se lee todo aunque sea grande (descartando lo que sobra): cortar a la mitad dejaba la conexión rota
+    raw = ''; let largo = 0;
+    for await (const chunk of req) { largo += chunk.length; if (largo <= 1e6) raw += chunk; }
+    if (largo > 1e6) throw new BadRequest('Pedido demasiado grande');
   }
   if (Buffer.isBuffer(raw)) raw = raw.toString();
-  if (typeof raw !== 'string') return raw ?? {};
-  try { return JSON.parse(raw || '{}'); } catch { throw new BadRequest('JSON inválido'); }
+  let b = raw;
+  if (typeof raw === 'string') { try { b = JSON.parse(raw || '{}'); } catch { throw new BadRequest('JSON inválido'); } }
+  // tiene que ser un objeto: con null, una lista o un número las rutas fallaban con error 500
+  check(b && typeof b === 'object' && !Array.isArray(b), 'JSON inválido');
+  return b;
 }
 
 export async function handler(req, res) {

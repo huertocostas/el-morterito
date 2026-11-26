@@ -337,6 +337,32 @@ try {
   await api('POST', '/api/usuario/salir');
   assert.equal((await api('GET', '/api/productos')).status, 200);
 
+  // errores forzados: cuerpos raros, números absurdos y tickets enormes dan 400 (nunca 500)
+  await api('POST', '/api/usuario/entrar', { pin: '4321' }); // la prueba anterior salió del usuario
+  const crudo = (path, body) => fetch(`http://127.0.0.1:${PORT}${path}`, { method: 'POST', body, headers: { cookie } }).then(r => r.status);
+  for (const body of ['null', '[]', '123', 'true']) assert.equal(await crudo('/api/gastos', body), 400, `cuerpo ${body}`);
+  const vtaRara = item => api('POST', '/api/movimientos', { tipo: 'minorista', medio_pago: 'efectivo', fecha: '2026-11-09', items: Array.isArray(item) ? item : [{ producto_id: yerba, cantidad: 1, precio_unitario: 10, ...item }] });
+  for (const item of [{ precio_unitario: 1e308 }, { precio_unitario: 2e9 }, { cantidad: 2e6 }, { cantidad: 'Infinity' }])
+    assert.equal((await vtaRara(item)).status, 400, JSON.stringify(item));
+  assert.equal((await vtaRara(Array.from({ length: 201 }, () => ({ producto_id: yerba, cantidad: 1, precio_unitario: 1 })))).status, 400, '201 renglones');
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-09', categoria: 'Otros', monto: 1e20, medio_pago: 'efectivo' })).status, 400);
+  assert.equal(await crudo('/api/gastos', JSON.stringify({ x: 'y'.repeat(1.2e6) })), 400, 'pedido de más de 1 MB');
+  assert.equal((await api('GET', '/api/sesion')).status, 200, 'la conexión sigue sana después de un pedido enorme');
+
+  // usuarios dados de baja: cargarlo de nuevo con el mismo nombre lo reactiva; reactivar pide PIN nuevo
+  const otraVez = await api('POST', '/api/usuarios', { admin: 'clave-test', nombre: 'beto', pin: '6789' });
+  assert.deepEqual([otraVez.status, otraVez.data.reactivado], [200, true]);
+  assert.ok((await api('GET', '/api/usuarios')).data.find(u => u.nombre === 'Beto').activo);
+  await api('POST', '/api/usuarios', { admin: 'clave-test', id: otraVez.data.id, activo: false });
+  assert.equal((await api('POST', '/api/usuarios', { admin: 'clave-test', id: otraVez.data.id, activo: true })).status, 400, 'reactivar sin PIN nuevo');
+
+  // el turno de usuario también vence en el servidor (14 h) y no se puede falsificar
+  const firmaU = (id, t) => createHmac('sha256', 'clave-test').update(`usuario:${id}:${t}`).digest('hex');
+  const turno = horas => { const t = (Date.now() - horas * 3600e3).toString(36); return `${ana}.${t}.${firmaU(ana, t)}`; };
+  const sesionCon = u => fetch(`http://127.0.0.1:${PORT}/api/sesion`, { headers: { cookie: `sesion=${jar.get('sesion')}; usuario=${u}` } }).then(r => r.json());
+  assert.equal((await sesionCon(turno(1))).usuario, ana);
+  assert.equal((await sesionCon(turno(15))).usuario, null, 'turno vencido');
+
   // sesiones: vencen del lado del servidor a los 30 días y no se pueden falsificar
   const conCookie = c => fetch(`http://127.0.0.1:${PORT}/api/productos`, { headers: { cookie: c } }).then(r => r.status);
   const firmar = t => createHmac('sha256', 'clave-test|clave-test').update('sesion:' + t).digest('hex'); // misma receta que el servidor
@@ -348,6 +374,15 @@ try {
 
   await api('POST', '/api/logout');
   assert.equal((await api('GET', '/api/productos')).status, 401);
+
+  // PINs: el límite es por dispositivo; otro dispositivo (otra sesión) en la misma red no queda bloqueado
+  await api('POST', '/api/login', { password: 'clave-test' });
+  for (let i = 0; i < 8; i++) await api('POST', '/api/usuario/entrar', { pin: '000' + i });
+  assert.equal((await api('POST', '/api/usuario/entrar', { pin: '4321' })).status, 429, 'este dispositivo, bloqueado');
+  const otroDispositivo = `sesion=${tNuevo}.${firmar(tNuevo)}`;
+  const enOtro = await fetch(`http://127.0.0.1:${PORT}/api/usuario/entrar`, { method: 'POST', headers: { cookie: otroDispositivo }, body: JSON.stringify({ pin: '4321' }) });
+  assert.equal(enOtro.status, 200, 'el otro dispositivo sigue pudiendo entrar');
+  await api('POST', '/api/logout');
 
   // límite de intentos: tras 8 contraseñas incorrectas se bloquea (aunque después pongan la correcta)
   for (let i = 0; i < 8; i++) assert.equal((await api('POST', '/api/login', { password: 'no-' + i })).status, 400);

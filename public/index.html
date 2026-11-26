@@ -571,6 +571,7 @@ async function api(method, path, body) {
 function flash(el, text, bad) { el.textContent = text; el.className = 'msg ' + (bad ? 'bad' : 'muted'); }
 // para cargas de secciones: que un error se vea (sin sesión ya se muestra el login)
 const avisar = err => { if (err.status !== 401) toast(err.message, true); };
+const hayVentanaAbierta = () => !!document.querySelector('dialog[open]');
 // aviso que aparece abajo y se va solo (en vez de la ventana alert del navegador)
 let toastTimer;
 function toast(text, error = false) {
@@ -684,7 +685,9 @@ let stockProd = null, stockAccion = 'entrada';
 function setAccion(a) {
   stockAccion = a;
   document.querySelectorAll('#stockAccion button').forEach(b => b.classList.toggle('on', b.dataset.accion === a));
-  $('#stockPregunta').textContent = ACCIONES[a][0];
+  // la unidad a la vista: en productos por kg es fácil escribir 500 pensando en gramos
+  const u = stockProd.unidad;
+  $('#stockPregunta').textContent = `${ACCIONES[a][0]} (${u === 'kg' ? 'en kg: 500 g = 0,5' : `en ${PLURAL[u] ?? u}`})`;
   ayudaStock();
 }
 // explica la acción y muestra cómo va a quedar el stock con lo que se escribió
@@ -733,6 +736,11 @@ $('#formProd').onsubmit = async e => {
   e.preventDefault();
   const f = e.target, data = Object.fromEntries(new FormData(f));
   data.activo = f.activo.checked;
+  // cambiar la unidad no convierte el stock: 10 unidades pasarían a leerse como 10 kg
+  const antes = data.id && productos.find(p => p.id == data.id);
+  if (antes && antes.unidad !== data.unidad && antes.stock !== 0 && !confirm(
+    `Vas a cambiar "${antes.nombre}" de ${antes.unidad} a ${data.unidad}.\n\nEl stock actual (${cuanto(antes.stock, antes.unidad)}) se va a leer como ${qty(antes.stock)} ${data.unidad}. `
+    + `Después corregilo con Stock → "Conté".\n\n¿Seguir?`)) return;
   try {
     const { id } = await api('POST', '/api/productos', data);
     if (!data.id && Number(data.stock_inicial) > 0)
@@ -813,6 +821,7 @@ const FRACCIONES = [100, 150, 200, 250, 500, 750, 1000]; // gramos
 const dlgFraccion = $('#dlgFraccion');
 let fracProd = null;
 function abrirFraccion(p) {
+  if (!(p.precio_minorista > 0)) return toast(`"${p.nombre}" no tiene precio minorista por kg: cargalo en Productos.`, true);
   fracProd = p;
   $('#fracTitulo').textContent = p.nombre;
   $('#fracPrecio').textContent = `${money(p.precio_minorista)} el kilo · se fracciona desde 100 g`;
@@ -1089,7 +1098,7 @@ async function verificarApertura() {
 let diaAbierto = hoy();
 function revisarDia() {
   const d = hoy();
-  if (d === diaAbierto) return;
+  if (d === diaAbierto || hayVentanaAbierta()) return; // con una ventana abierta, se reintenta al minuto
   for (const el of [$('#fecha'), $('#mHasta'), $('#formGasto').fecha, $('#iFecha')]) if (el.value === diaAbierto) el.value = d;
   if ($('#gMes').value === diaAbierto.slice(0, 7)) $('#gMes').value = d.slice(0, 7);
   if ($('#mDesde').value === diaAbierto.slice(0, 8) + '01') $('#mDesde').value = d.slice(0, 8) + '01';
@@ -1104,7 +1113,7 @@ setInterval(revisarDia, 60 * 1000);
 const HORA_CIERRE = 22;
 const dlgCierre = $('#dlgCierre');
 async function revisarCierre() {
-  if (!$('#login').hidden || dlgCierre.open || dlgApertura.open || dlgStock.open) return;
+  if (!$('#login').hidden || hayVentanaAbierta()) return; // no interrumpir lo que estén haciendo; se reintenta al minuto
   if (new Date().getHours() < HORA_CIERRE || local.get('avisoCierre') === hoy() || Date.now() < Number(local.get('cierrePospuesto') || 0)) return;
   const d = await api('GET', `/api/informe?desde=${hoy()}&hasta=${hoy()}`);
   const cobrado = m => d.ventas_medio.find(x => x.medio_pago === m)?.total || 0;
@@ -1229,7 +1238,8 @@ async function cambioUsuarios(datos, ok) {
 $('#formUsuarios').onsubmit = async e => {
   e.preventDefault();
   const f = e.target, nombre = f.nombre.value.trim();
-  if (await cambioUsuarios({ nombre, pin: f.pin.value }, `${nombre} agregado. Ya puede entrar con su PIN.`)) { f.nombre.value = ''; f.pin.value = ''; }
+  const deBaja = usuarios.find(u => !u.activo && norm(u.nombre) === norm(nombre)); // volver a cargarlo lo reactiva
+  if (await cambioUsuarios({ nombre, pin: f.pin.value }, `${deBaja ? `${deBaja.nombre} reactivado` : `${nombre} agregado`}. Ya puede entrar con su PIN.`)) { f.nombre.value = ''; f.pin.value = ''; }
 };
 $('#listaUsuarios').onclick = async e => {
   const { pin, baja } = e.target.dataset, u = usuarios.find(x => x.id == (pin || baja));
@@ -1311,7 +1321,13 @@ $('#mDesde').value = hoy().slice(0, 8) + '01'; $('#gMes').value = hoy().slice(0,
 $('#formGasto').fecha.value = $('#iFecha').value = hoy();
 $('#formLogin').onsubmit = async e => {
   e.preventDefault();
-  try { await api('POST', '/api/login', { password: $('#pass').value }); location.reload(); }
+  try {
+    await api('POST', '/api/login', { password: $('#pass').value });
+    // si la app ya estaba andando (se venció la sesión a mitad de algo), no recargar: se perdería el ticket
+    if (!productos.length) return location.reload();
+    $('#login').hidden = true; $('#pass').value = ''; flash($('#msgLogin'), '');
+    toast('Listo, volviste a entrar. Repetí lo último que estabas haciendo.');
+  }
   catch (err) { flash($('#msgLogin'), err.message, true); }
 };
 $('#salir').onclick = async () => { await api('POST', '/api/logout'); location.reload(); };
