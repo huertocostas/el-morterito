@@ -224,6 +224,26 @@ try {
   assert.equal((await api('POST', '/api/cierre', { fecha: '2026-11-21', contado: 300 })).data.esperado, 300);   // solo la del 21
   assert.equal((await api('GET', '/api/informe?desde=2026-11-21&hasta=2026-11-21')).data.apertura, 300);
 
+  // granel por kg: minorista fracciona desde 100 g al precio por kg; mayorista desde 1 kg
+  const { data: { id: granel } } = await api('POST', '/api/productos', { nombre: 'Mix energético', unidad: 'kg', costo: 9000, precio_minorista: 18000, precio_mayorista: 15000 });
+  await api('POST', '/api/stock', { producto_id: granel, accion: 'entrada', cantidad: 5, fecha: '2026-11-22' });
+  const vender = (tipo, cantidad, precio) => api('POST', '/api/movimientos', { tipo, medio_pago: 'efectivo', fecha: '2026-11-22', items: [{ producto_id: granel, cantidad, precio_unitario: precio }] });
+  const chico = await vender('minorista', 0.05, 18000);
+  assert.deepEqual([chico.status, chico.data.error], [400, '"Mix energético": se fracciona desde 100 g']);
+  assert.equal((await vender('minorista', 0.1, 18000)).status, 200);   // 100 g justo
+  assert.equal((await vender('minorista', 0.15, 18000)).status, 200);  // 150 g
+  const mayChico = await vender('mayorista', 0.5, 15000);
+  assert.deepEqual([mayChico.status, mayChico.data.error], [400, '"Mix energético": la venta mayorista es desde 1 kg']);
+  assert.equal((await vender('mayorista', 1.5, 15000)).status, 200);
+  // montos y ganancia respetando el precio por kg: 250 g minorista = $4.500 (ganancia $2.250); 1,5 kg mayorista = $22.500 (ganancia $9.000)
+  const inf22 = (await api('GET', '/api/informe?desde=2026-11-22&hasta=2026-11-22')).data;
+  const v22 = t => inf22.ventas.find(x => x.tipo === t);
+  assert.deepEqual([Math.round(v22('minorista').total), Math.round(v22('minorista').ganancia)], [4500, 2250]);
+  assert.deepEqual([v22('mayorista').total, v22('mayorista').ganancia], [22500, 9000]);
+  assert.ok(Math.abs((await api('GET', '/api/productos')).data.find(p => p.id === granel).stock - (5 - 0.25 - 1.5)) < 1e-9); // descuenta en kg
+  // los productos por unidad no tienen mínimo de peso
+  assert.equal((await api('POST', '/api/movimientos', { tipo: 'mayorista', medio_pago: 'efectivo', fecha: '2026-11-22', items: [{ producto_id: yerba, cantidad: 1, precio_unitario: 80 }] })).status, 200);
+
   // ---------- usuarios ----------
   // mientras no haya usuarios, se registra sin PIN (como antes)
   assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-06', categoria: 'Otros', monto: 1, medio_pago: 'efectivo' })).status, 200);

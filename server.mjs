@@ -203,7 +203,8 @@ async function confirmarConPin(b, req) {
 // borrar deja rastro: qué era, de qué día, quién lo borró y cuándo
 const plata = n => new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(n);
 const PLURAL = { unidad: 'unidades', paquete: 'paquetes', litro: 'litros' };
-const cuanto = (n, u) => `${new Intl.NumberFormat('es-AR', { maximumFractionDigits: 3 }).format(n)} ${Math.abs(n) === 1 ? u : PLURAL[u] ?? u}`;
+const cuanto = (n, u) => u === 'kg' && Math.abs(n) < 1 ? `${Math.round(n * 1000)} g` // fracciones: "150 g" mejor que "0,15 kg"
+  : `${new Intl.NumberFormat('es-AR', { maximumFractionDigits: 3 }).format(n)} ${Math.abs(n) === 1 ? u : PLURAL[u] ?? u}`;
 const registroBorrado = (fecha, uid, detalle) =>
   ({ sql: 'INSERT INTO borrados (fecha, creado, usuario_id, detalle) VALUES (?, ?, ?, ?)', args: [fecha, ahora(), uid, detalle] });
 // shortcut: Argentina es UTC-3 todo el año (sin horario de verano); si el negocio cambia de país, usar Intl con su zona
@@ -341,7 +342,8 @@ const routes = {
     check(!venta || MEDIOS.includes(b.medio_pago), 'Elegí el medio de pago');
     const ids = [...new Set(b.items.map(it => Number(it.producto_id)))];
     check(ids.every(Number.isInteger), 'Producto inexistente');
-    const existen = await all(`SELECT id, nombre, costo, activo FROM productos WHERE id IN (${ids.map(() => '?')})`, ids);
+    const existen = await all(`SELECT id, nombre, costo, activo, unidad FROM productos WHERE id IN (${ids.map(() => '?')})`, ids);
+    const prod = Object.fromEntries(existen.map(p => [p.id, p]));
     check(existen.length === ids.length, 'Producto inexistente');
     const inactivo = existen.find(p => !p.activo);
     check(!venta || !inactivo, `"${inactivo?.nombre}" está desactivado: activalo en Productos para venderlo`);
@@ -355,6 +357,10 @@ const routes = {
       check(cant !== 0, 'La cantidad no puede ser 0');
       const precio = num(it.precio_unitario, 'Precio');
       check(!venta || precio > 0, 'Hay un producto con precio $0: cargale el precio antes de cobrar');
+      // por kilo: el minorista fracciona desde 100 g y el mayorista vende desde 1 kg (precio por kg en los dos)
+      const p = prod[Number(it.producto_id)], minimo = { minorista: 0.1, mayorista: 1 }[b.tipo];
+      check(!(minimo && p.unidad === 'kg' && cant + 1e-9 < minimo),
+        b.tipo === 'mayorista' ? `"${p.nombre}": la venta mayorista es desde 1 kg` : `"${p.nombre}": se fracciona desde 100 g`);
       return {
         sql: 'INSERT INTO movimientos (fecha, tipo, producto_id, cantidad, precio_unitario, costo_unitario, medio_pago, usuario_id, creado) VALUES (?,?,?,?,?,?,?,?,?)',
         args: [b.fecha, b.tipo, Number(it.producto_id), venta ? -cant : cant, precio,

@@ -187,6 +187,10 @@
   #salir { background: transparent; color: inherit; border-color: rgba(255,255,255,.4); }
   #usuarioBtn, #instalar { background: transparent; color: inherit; border-color: rgba(255,255,255,.4); padding: 5px 10px;
     max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fracciones { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; }
+  .fracciones button { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 10px 6px; }
+  .fracciones button b { font-size: 16px; }
+  .fracciones button:hover { border-color: var(--accent); }
   #listaUsuarios .fila { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid var(--line); }
   #listaUsuarios .fila span { flex: 1; }
   #tema { background: transparent; color: inherit; border-color: rgba(255,255,255,.4); padding: 5px 8px; line-height: 0; }
@@ -250,6 +254,20 @@
 </dialog>
 
 <div id="toast" role="status" aria-live="polite" hidden></div>
+
+<dialog id="dlgFraccion" aria-labelledby="fracTitulo">
+  <form id="formFraccion">
+    <h2 id="fracTitulo"></h2>
+    <p class="muted" id="fracPrecio" style="margin:0"></p>
+    <div class="fracciones" id="fracBotones" role="group" aria-label="Cantidad"></div>
+    <div class="row">
+      <label style="flex:1 1 140px">Otra cantidad (gramos)<input type="number" name="gramos" min="100" step="1" inputmode="numeric"></label>
+      <button class="primary">Agregar</button>
+    </div>
+    <p class="muted" id="fracOtra" style="margin:0"></p>
+    <button type="button" class="link" id="fracCancelar" style="color:var(--muted)">Cancelar</button>
+  </form>
+</dialog>
 
 <dialog id="dlgPin" aria-labelledby="pinTitulo">
   <form id="formPin">
@@ -400,6 +418,7 @@
           <label style="flex:1 1 120px" id="stockIniWrap">Stock inicial<input name="stock_inicial" type="number" step="any" min="0"></label>
           <label class="check" id="activoWrap" hidden><input type="checkbox" name="activo" checked> Activo</label>
         </div>
+        <p class="muted" id="ayudaKg" hidden style="margin:8px 0 0">Por kilo: costo y precios son <b>por kg</b>. En minorista se fracciona desde 100 g y en mayorista se vende desde 1 kg.</p>
         <div class="row" style="margin-top:12px">
           <button class="primary">Guardar producto</button>
           <button type="button" id="pCancelar" hidden>Cancelar</button>
@@ -517,7 +536,13 @@ const money = n => new Intl.NumberFormat('es-AR', { style: 'currency', currency:
 const qty = n => new Intl.NumberFormat('es-AR', { maximumFractionDigits: 3 }).format(n || 0);
 // "10 unidades", "1 unidad", "2,5 kg" (ya escapado)
 const PLURAL = { unidad: 'unidades', paquete: 'paquetes', litro: 'litros' };
-const cuanto = (n, u) => `${qty(n)} ${esc(Math.abs(n) === 1 ? u : PLURAL[u] ?? u)}`;
+const cuanto = (n, u) => u === 'kg' && Math.abs(n) < 1 ? `${Math.round(n * 1000)} g` // fracciones: "150 g" mejor que "0,15 kg"
+  : `${qty(n)} ${esc(Math.abs(n) === 1 ? u : PLURAL[u] ?? u)}`;
+// productos por kilo: el minorista fracciona desde 100 g y el mayorista vende desde 1 kg (los dos a precio por kg)
+const porKg = p => p.unidad === 'kg';
+const MINIMO_KG = { minorista: 0.1, mayorista: 1 };
+const debajoDelMinimo = l => porKg(l.p) && l.cantidad + 1e-9 < (MINIMO_KG[tipo] ?? 0);
+const avisoMinimo = () => tipo === 'mayorista' ? 'la venta mayorista es desde 1 kg' : 'se fracciona desde 100 g';
 const hoy = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD en hora local
 // hora local en que se registró algo (el servidor la guarda en UTC); lo viejo no tiene
 const horaDe = iso => iso ? new Date(iso).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: false }) : '';
@@ -622,7 +647,7 @@ $('#tablaProd').onclick = e => {
   if (!p) return;
   const f = $('#formProd');
   for (const k of ['id', 'nombre', 'categoria', 'unidad', 'costo', 'precio_minorista', 'precio_mayorista', 'stock_minimo']) f[k].value = p[k];
-  f.activo.checked = !!p.activo;
+  f.activo.checked = !!p.activo; ayudaKg();
   $('#pTitulo').textContent = 'Editar: ' + p.nombre;
   $('#stockIniWrap').hidden = true; $('#activoWrap').hidden = false; $('#pCancelar').hidden = $('#pBorrar').hidden = $('#pStock').hidden = false;
   flash($('#msgProd'), 'Para cambiar el stock tocá "Cambiar stock".');
@@ -632,7 +657,10 @@ function resetProd() {
   $('#formProd').reset(); $('#formProd').id.value = '';
   $('#pTitulo').textContent = 'Nuevo producto';
   $('#stockIniWrap').hidden = false; $('#activoWrap').hidden = true; $('#pCancelar').hidden = $('#pBorrar').hidden = $('#pStock').hidden = true;
+  ayudaKg();
 }
+const ayudaKg = () => { $('#ayudaKg').hidden = $('#formProd').unidad.value !== 'kg'; };
+$('#formProd').unidad.onchange = ayudaKg;
 $('#pStock').onclick = () => { const p = productos.find(p => p.id == $('#formProd').id.value); if (p) abrirStock(p); };
 
 // ---------- stock: entró, salió o conté ----------
@@ -762,39 +790,72 @@ function pintarTiles() {
   $('#tiles').innerHTML = lista.map(p => `<button class="tile" data-id="${p.id}">
       <span class="t-nombre">${esc(p.nombre)}</span>
       <span class="t-meta ${p.stock <= p.stock_minimo ? 'bad' : ''}">${cuanto(p.stock, p.unidad)} en stock</span>
-      <span class="t-precio">${esVenta() ? money(precioDe(p)) : ''}</span></button>`).join('')
+      <span class="t-precio">${esVenta() ? money(precioDe(p)) + (porKg(p) ? '<span class="muted"> /kg</span>' : '') : ''}</span>
+      ${esVenta() && porKg(p) ? `<span class="t-meta">${tipo === 'mayorista' ? 'desde 1 kg' : 'fraccionado desde 100 g'}</span>` : ''}</button>`).join('')
     || `<p class="muted">${productos.length ? 'Ningún producto coincide con la búsqueda.' : 'Todavía no hay productos: crealos en "Productos".'}</p>`;
 }
-function agregar(p) {
+// cant: unidades, o kilos en productos por kg (1 kg por defecto en mayorista)
+function agregar(p, cant = 1) {
   const l = lineas.find(l => l.p.id === p.id);
-  if (l) l.cantidad += 1; else lineas.push({ p, cantidad: 1, precio: precioDe(p) });
+  if (l) l.cantidad = Math.round((l.cantidad + cant) * 1000) / 1000; else lineas.push({ p, cantidad: cant, precio: precioDe(p) });
   $('#q').value = ''; flash($('#msgCargar'), '');
   pintarTiles(); pintarLineas(); enfocarBusqueda();
 }
+// en minorista, un producto por kilo se fracciona: se elige cuántos gramos
+const elegir = p => porKg(p) && tipo === 'minorista' ? abrirFraccion(p) : agregar(p);
 $('#tiles').onclick = e => {
   const b = e.target.closest('.tile');
-  if (b) agregar(productos.find(p => p.id == b.dataset.id));
+  if (b) elegir(productos.find(p => p.id == b.dataset.id));
 };
+
+// ---------- fraccionar productos por kilo ----------
+const FRACCIONES = [100, 150, 200, 250, 500, 750, 1000]; // gramos
+const dlgFraccion = $('#dlgFraccion');
+let fracProd = null;
+function abrirFraccion(p) {
+  fracProd = p;
+  $('#fracTitulo').textContent = p.nombre;
+  $('#fracPrecio').textContent = `${money(p.precio_minorista)} el kilo · se fracciona desde 100 g`;
+  $('#fracBotones').innerHTML = FRACCIONES.map(g => `<button type="button" data-g="${g}">
+      <b>${g < 1000 ? `${g} g` : '1 kg'}</b><span class="muted">${money(p.precio_minorista * g / 1000)}</span></button>`).join('');
+  $('#formFraccion').gramos.value = ''; $('#fracOtra').textContent = '';
+  dlgFraccion.showModal();
+}
+$('#fracBotones').onclick = e => {
+  const b = e.target.closest('[data-g]');
+  if (b) { dlgFraccion.close(); agregar(fracProd, Number(b.dataset.g) / 1000); }
+};
+$('#formFraccion').gramos.oninput = e => {
+  const v = e.target.value, g = Number(v);
+  $('#fracOtra').textContent = !v ? '' : g >= 100 ? `${g} g = ${money(fracProd.precio_minorista * g / 1000)}` : 'Mínimo 100 g';
+};
+$('#formFraccion').onsubmit = e => {
+  e.preventDefault();
+  const g = Number(e.target.gramos.value);
+  if (g >= 100) { dlgFraccion.close(); agregar(fracProd, g / 1000); }
+};
+$('#fracCancelar').onclick = () => dlgFraccion.close();
 $('#cats').onclick = e => {
   const b = e.target.closest('[data-cat]');
   if (b) { categoria = b.dataset.cat; pintarTiles(); enfocarBusqueda(); }
 };
 $('#q').oninput = pintarTiles;
 $('#q').onkeydown = e => {
-  if (e.key === 'Enter' && $('#q').value.trim() && filtrados()[0]) agregar(filtrados()[0]);
+  if (e.key === 'Enter' && $('#q').value.trim() && filtrados()[0]) elegir(filtrados()[0]);
   if (e.key === 'Escape') { $('#q').value = ''; pintarTiles(); }
 };
 
 function pintarLineas() {
-  $('#lineas').innerHTML = lineas.map((l, i) => `<div class="linea">
+  // los productos por kilo se cargan en gramos (el precio sigue siendo por kg)
+  $('#lineas').innerHTML = lineas.map((l, i) => { const kg = porKg(l.p); return `<div class="linea">
       <div class="l-top"><span>${esc(l.p.nombre)}</span><button class="x" data-del="${i}" aria-label="Quitar ${esc(l.p.nombre)}">×</button></div>
       <div class="l-bot">
-        <div class="qty"><button data-paso="-1" data-i="${i}" aria-label="Uno menos">−</button><input type="number" step="any" data-cant="${i}" value="${l.cantidad}" aria-label="Cantidad"><button data-paso="1" data-i="${i}" aria-label="Uno más">+</button></div>
-        <span class="muted">${esc(l.p.unidad)}</span>
-        ${!esVenta() ? '' : `<label class="precio">× $<input type="number" step="any" min="0" data-precio="${i}" value="${l.precio}" aria-label="Precio unitario"></label>
+        <div class="qty"><button data-paso="-1" data-i="${i}" aria-label="Menos">−</button><input type="number" step="any" data-cant="${i}" value="${kg ? Math.round(l.cantidad * 1000) : l.cantidad}" aria-label="${kg ? 'Gramos' : 'Cantidad'}"><button data-paso="1" data-i="${i}" aria-label="Más">+</button></div>
+        <span class="muted">${kg ? 'g' : esc(l.p.unidad)}</span>
+        ${!esVenta() ? '' : `<label class="precio">× $<input type="number" step="any" min="0" data-precio="${i}" value="${l.precio}" aria-label="Precio${kg ? ' por kg' : ' unitario'}">${kg ? '/kg' : ''}</label>
         <b class="l-sub" id="sub${i}"></b>`}
       </div>
-      <div class="warn bad" id="warn${i}"></div></div>`).join('')
+      <div class="warn bad" id="warn${i}"></div></div>`; }).join('')
     || '<p class="muted vacio">Todavía no hay productos en el ticket.</p>';
   actualizarTotales();
 }
@@ -803,7 +864,8 @@ function actualizarTotales() {
   lineas.forEach((l, i) => {
     if ($('#sub' + i)) $('#sub' + i).textContent = money(l.cantidad * l.precio);
     // aviso si la venta deja el stock negativo (se permite igual: el stock cargado puede estar mal)
-    $('#warn' + i).textContent = esVenta() && l.cantidad > l.p.stock ? `Ojo: hay ${cuanto(l.p.stock, l.p.unidad)} en stock` : '';
+    $('#warn' + i).textContent = esVenta() && debajoDelMinimo(l) ? `Mínimo: ${avisoMinimo()}`
+      : esVenta() && l.cantidad > l.p.stock ? `Ojo: hay ${cuanto(l.p.stock, l.p.unidad)} en stock` : '';
   });
   $('#totalWrap').hidden = $('#pago').hidden = !esVenta();
   $('#total').textContent = money(totalTicket());
@@ -816,21 +878,26 @@ $('#lineas').onclick = e => {
   const d = e.target.dataset;
   if (d.del) lineas.splice(d.del, 1);
   else if (d.paso) {
-    const l = lineas[d.i];
-    l.cantidad = Math.round((l.cantidad + Number(d.paso)) * 1000) / 1000;
-    if (l.cantidad <= 0 && tipo !== 'ajuste') lineas.splice(d.i, 1);
+    const l = lineas[d.i], kg = porKg(l.p);
+    // por kilo: de a 50 g en minorista, de a medio kilo en mayorista, sin bajar del mínimo (para quitar está la ×)
+    const paso = kg ? (tipo === 'mayorista' ? 0.5 : 0.05) : 1;
+    l.cantidad = Math.round((l.cantidad + Number(d.paso) * paso) * 1000) / 1000;
+    if (kg) l.cantidad = Math.max(l.cantidad, MINIMO_KG[tipo] ?? paso);
+    else if (l.cantidad <= 0 && tipo !== 'ajuste') lineas.splice(d.i, 1);
   } else return;
   pintarLineas();
 };
 $('#lineas').oninput = e => {
   const d = e.target.dataset;
-  if (d.cant) lineas[d.cant].cantidad = Number(e.target.value) || 0;
+  if (d.cant) { const l = lineas[d.cant]; l.cantidad = (Number(e.target.value) || 0) / (porKg(l.p) ? 1000 : 1); } // por kg: se escribe en gramos
   if (d.precio) lineas[d.precio].precio = Number(e.target.value) || 0;
   actualizarTotales();
 };
 $('#limpiar').onclick = () => { lineas = []; pintarLineas(); flash($('#msgCargar'), ''); enfocarBusqueda(); };
 $('#guardar').onclick = async () => {
   if (lineas.some(l => !l.cantidad)) return flash($('#msgCargar'), 'Hay un producto con cantidad 0.', true);
+  const chico = lineas.find(debajoDelMinimo);
+  if (chico) return flash($('#msgCargar'), `"${chico.p.nombre}": ${avisoMinimo()}.`, true);
   const sinPrecio = lineas.find(l => !(l.precio > 0));
   if (sinPrecio) return flash($('#msgCargar'), `"${sinPrecio.p.nombre}" tiene precio $0: escribí el precio o cargalo en Productos.`, true);
   revisarDia(); // que una venta hecha pasada la medianoche no quede con la fecha de ayer
