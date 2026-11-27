@@ -413,13 +413,13 @@
         </div>
         <div class="row" style="margin-top:10px">
           <label style="flex:1 1 120px">Costo<input name="costo" type="number" step="any" min="0" placeholder="lo que te cuesta"></label>
-          <label style="flex:1 1 120px">Precio minorista<input name="precio_minorista" type="number" step="any" min="0"></label>
+          <label style="flex:1 1 120px">Precio minorista<span id="sufMin"></span><input name="precio_minorista" type="number" step="any" min="0"></label>
           <label style="flex:1 1 120px">Precio mayorista<input name="precio_mayorista" type="number" step="any" min="0"></label>
           <label style="flex:1 1 120px">Stock mínimo<input name="stock_minimo" type="number" step="any" min="0"></label>
           <label style="flex:1 1 120px" id="stockIniWrap">Stock inicial<input name="stock_inicial" type="number" step="any" min="0"></label>
           <label class="check" id="activoWrap" hidden><input type="checkbox" name="activo" checked> Activo</label>
         </div>
-        <p class="muted" id="ayudaKg" hidden style="margin:8px 0 0">Por kilo: costo y precios son <b>por kg</b>. En minorista se fracciona desde 100 g y en mayorista se vende desde 1 kg.</p>
+        <p class="muted" id="ayudaKg" hidden style="margin:8px 0 0">Por kilo: el costo y el mayorista son <b>por kg</b>; el minorista es <b>por 100 g</b>. En minorista se fracciona desde 100 g y en mayorista se vende desde 1 kg.</p>
         <div class="row" style="margin-top:12px">
           <button class="primary">Guardar producto</button>
           <button type="button" id="pCancelar" hidden>Cancelar</button>
@@ -541,7 +541,10 @@ const cuanto = (n, u) => u === 'kg' && Math.abs(n) < 1 ? `${Math.round(n * 1000)
   : `${qty(n)} ${esc(Math.abs(n) === 1 ? u : PLURAL[u] ?? u)}`;
 // productos por kilo: el minorista fracciona desde 100 g y el mayorista vende desde 1 kg (los dos a precio por kg)
 const porKg = p => p.unidad === 'kg';
+// por kg el minorista se carga y se muestra por 100 g (como se vende en el local), pero se guarda por kg
+const minorista100 = p => porKg(p) ? p.precio_minorista / 10 : p.precio_minorista;
 const MINIMO_KG = { minorista: 0.1, mayorista: 1 };
+const por100 = l => porKg(l.p) && tipo === 'minorista';
 const debajoDelMinimo = l => porKg(l.p) && l.cantidad + 1e-9 < (MINIMO_KG[tipo] ?? 0);
 const avisoMinimo = () => tipo === 'mayorista' ? 'la venta mayorista es desde 1 kg' : 'se fracciona desde 100 g';
 const hoy = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD en hora local
@@ -636,7 +639,7 @@ function pintarProductos() {
       <td>${esc(p.nombre)}${p.activo ? '' : ' <span class="muted">(inactivo)</span>'}</td><td>${esc(p.categoria)}</td>
       <td class="n">${cuanto(p.stock, p.unidad)}</td><td class="n">${qty(p.stock_minimo)}</td>
       <td class="n">${p.costo ? money(p.costo) : '<span class="muted">—</span>'}</td>
-      <td class="n">${money(p.precio_minorista)}</td><td class="n">${money(p.precio_mayorista)}</td>
+      <td class="n">${money(minorista100(p))}${porKg(p) ? '<span class="muted"> /100 g</span>' : ''}</td><td class="n">${money(p.precio_mayorista)}</td>
       <td class="n">${margen(p)}</td></tr>`).join('')
     || '<tr><td colspan="8" class="muted">Sin productos.</td></tr>';
 }
@@ -652,6 +655,7 @@ $('#tablaProd').onclick = e => {
   if (!p) return;
   const f = $('#formProd');
   for (const k of ['id', 'nombre', 'categoria', 'unidad', 'costo', 'precio_minorista', 'precio_mayorista', 'stock_minimo']) f[k].value = p[k];
+  f.precio_minorista.value = minorista100(p);
   f.activo.checked = !!p.activo; ayudaKg();
   $('#pTitulo').textContent = 'Editar: ' + p.nombre;
   $('#stockIniWrap').hidden = true; $('#activoWrap').hidden = false; $('#pCancelar').hidden = $('#pBorrar').hidden = $('#pStock').hidden = false;
@@ -664,7 +668,7 @@ function resetProd() {
   $('#stockIniWrap').hidden = false; $('#activoWrap').hidden = true; $('#pCancelar').hidden = $('#pBorrar').hidden = $('#pStock').hidden = true;
   ayudaKg();
 }
-const ayudaKg = () => { $('#ayudaKg').hidden = $('#formProd').unidad.value !== 'kg'; };
+const ayudaKg = () => { const kg = $('#formProd').unidad.value === 'kg'; $('#ayudaKg').hidden = !kg; $('#sufMin').textContent = kg ? ' (100 g)' : ''; };
 $('#formProd').unidad.onchange = ayudaKg;
 $('#pStock').onclick = () => { const p = productos.find(p => p.id == $('#formProd').id.value); if (p) abrirStock(p); };
 
@@ -740,6 +744,11 @@ $('#formProd').onsubmit = async e => {
   e.preventDefault();
   const f = e.target, data = Object.fromEntries(new FormData(f));
   data.activo = f.activo.checked;
+  if (data.unidad === 'kg' && data.precio_minorista !== '') data.precio_minorista = Math.round(Number(data.precio_minorista) * 1000) / 100; // 100 g -> kg
+  const c = Number(data.costo), pm = Number(data.precio_minorista);
+  if (c > 0 && pm > 0 && pm < c && !confirm(`El precio minorista queda por debajo del costo${data.unidad === 'kg' ? ' (comparado por kilo)' : ''}: cada venta da pérdida.
+
+¿Guardar igual?`)) return;
   // cambiar la unidad no convierte el stock: 10 unidades pasarían a leerse como 10 kg
   const antes = data.id && productos.find(p => p.id == data.id);
   if (antes && antes.unidad !== data.unidad && antes.stock !== 0 && !confirm(
@@ -802,7 +811,7 @@ function pintarTiles() {
   $('#tiles').innerHTML = lista.map(p => `<button class="tile" data-id="${p.id}">
       <span class="t-nombre">${esc(p.nombre)}</span>
       <span class="t-meta ${p.stock <= p.stock_minimo ? 'bad' : ''}">${cuanto(p.stock, p.unidad)} en stock</span>
-      <span class="t-precio">${esVenta() ? money(precioDe(p)) + (porKg(p) ? '<span class="muted"> /kg</span>' : '') : ''}</span>
+      <span class="t-precio">${!esVenta() ? '' : porKg(p) && tipo === 'minorista' ? money(minorista100(p)) + '<span class="muted"> /100 g</span>' : money(precioDe(p)) + (porKg(p) ? '<span class="muted"> /kg</span>' : '')}</span>
       ${esVenta() && porKg(p) ? `<span class="t-meta">${tipo === 'mayorista' ? 'desde 1 kg' : 'fraccionado desde 100 g'}</span>` : ''}</button>`).join('')
     || `<p class="muted">${productos.length ? 'Ningún producto coincide con la búsqueda.' : 'Todavía no hay productos: crealos en "Productos".'}</p>`;
 }
@@ -825,10 +834,10 @@ const FRACCIONES = [100, 150, 200, 250, 500, 750, 1000]; // gramos
 const dlgFraccion = $('#dlgFraccion');
 let fracProd = null;
 function abrirFraccion(p) {
-  if (!(p.precio_minorista > 0)) return toast(`"${p.nombre}" no tiene precio minorista por kg: cargalo en Productos.`, true);
+  if (!(p.precio_minorista > 0)) return toast(`"${p.nombre}" no tiene precio minorista: cargalo en Productos.`, true);
   fracProd = p;
   $('#fracTitulo').textContent = p.nombre;
-  $('#fracPrecio').textContent = `${money(p.precio_minorista)} el kilo · se fracciona desde 100 g`;
+  $('#fracPrecio').textContent = `${money(minorista100(p))} los 100 g · se fracciona desde 100 g`;
   $('#fracBotones').innerHTML = FRACCIONES.map(g => `<button type="button" data-g="${g}">
       <b>${g < 1000 ? `${g} g` : '1 kg'}</b><span class="muted">${money(p.precio_minorista * g / 1000)}</span></button>`).join('');
   $('#formFraccion').gramos.value = ''; $('#fracOtra').textContent = '';
@@ -859,13 +868,13 @@ $('#q').onkeydown = e => {
 };
 
 function pintarLineas() {
-  // los productos por kilo se cargan en gramos (el precio sigue siendo por kg)
+  // los productos por kilo se cargan en gramos (el precio se guarda por kg; el minorista se ve por 100 g)
   $('#lineas').innerHTML = lineas.map((l, i) => { const kg = porKg(l.p); return `<div class="linea">
       <div class="l-top"><span>${esc(l.p.nombre)}</span><button class="x" data-del="${i}" aria-label="Quitar ${esc(l.p.nombre)}">×</button></div>
       <div class="l-bot">
         <div class="qty"><button data-paso="-1" data-i="${i}" aria-label="Menos">−</button><input type="number" step="any" data-cant="${i}" value="${kg ? Math.round(l.cantidad * 1000) : l.cantidad}" aria-label="${kg ? 'Gramos' : 'Cantidad'}"><button data-paso="1" data-i="${i}" aria-label="Más">+</button></div>
         <span class="muted">${kg ? 'g' : esc(l.p.unidad)}</span>
-        ${!esVenta() ? '' : `<label class="precio">× $<input type="number" step="any" min="0" data-precio="${i}" value="${l.precio}" aria-label="Precio${kg ? ' por kg' : ' unitario'}">${kg ? '/kg' : ''}</label>
+        ${!esVenta() ? '' : `<label class="precio">× $<input type="number" step="any" min="0" data-precio="${i}" value="${por100(l) ? l.precio / 10 : l.precio}" aria-label="Precio${por100(l) ? ' por 100 g' : kg ? ' por kg' : ' unitario'}">${por100(l) ? '/100 g' : kg ? '/kg' : ''}</label>
         <b class="l-sub" id="sub${i}"></b>`}
       </div>
       <div class="warn bad" id="warn${i}"></div></div>`; }).join('')
@@ -903,7 +912,7 @@ $('#lineas').onclick = e => {
 $('#lineas').oninput = e => {
   const d = e.target.dataset;
   if (d.cant) { const l = lineas[d.cant]; l.cantidad = (Number(e.target.value) || 0) / (porKg(l.p) ? 1000 : 1); } // por kg: se escribe en gramos
-  if (d.precio) lineas[d.precio].precio = Number(e.target.value) || 0;
+  if (d.precio) { const l = lineas[d.precio]; l.precio = (Number(e.target.value) || 0) * (por100(l) ? 10 : 1); }
   actualizarTotales();
 };
 $('#limpiar').onclick = () => { lineas = []; pintarLineas(); flash($('#msgCargar'), ''); enfocarBusqueda(); };
