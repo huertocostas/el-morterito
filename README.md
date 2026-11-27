@@ -20,9 +20,9 @@ Variables de entorno del proyecto en Vercel:
 |---|---|
 | `TURSO_DATABASE_URL` | URL de la base en Turso (`libsql://...`) |
 | `TURSO_AUTH_TOKEN` | Token de acceso de esa base |
-| `APP_PASSWORD` | Contraseña para entrar a la app (que sea larga) |
+| `APP_PASSWORD` | Contraseña para entrar a la app: 12 caracteres o más, que no se use en otro lado (es la única puerta de entrada) |
 
-Las tablas y columnas nuevas se crean solas en el primer uso. Cambiar `APP_PASSWORD` cierra todas las sesiones abiertas. Cada push a `main` se publica solo.
+Las tablas y columnas nuevas se crean solas en el primer uso. Si se pierde un celular: en la app, Usuarios → "Cerrar la sesión en todos los dispositivos". Si además la contraseña se filtró, cambiar `APP_PASSWORD` (también cierra todas las sesiones). Correcciones de caja, cambios de productos y de usuarios quedan en el Historial con quién los hizo. Cada push a `main` se publica solo.
 
 ## Respaldo de la base
 

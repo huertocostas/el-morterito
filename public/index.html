@@ -293,6 +293,7 @@
     </div>
     <button class="primary">Agregar usuario</button>
     <button type="button" class="link" id="usuariosCerrar" style="color:var(--muted)">Cerrar</button>
+    <button type="button" class="link" id="cerrarSesiones" style="color:var(--warn)">¿Se perdió un celular? Cerrar la sesión en todos los dispositivos</button>
     <div class="msg" id="msgUsuarios" style="margin:0"></div>
   </form>
 </dialog>
@@ -546,7 +547,10 @@ const avisoMinimo = () => tipo === 'mayorista' ? 'la venta mayorista es desde 1 
 const hoy = () => new Date().toLocaleDateString('en-CA'); // YYYY-MM-DD en hora local
 // hora local en que se registró algo (el servidor la guarda en UTC); lo viejo no tiene
 const horaDe = iso => iso ? new Date(iso).toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit', hour12: false }) : '';
-const conHora = (f, iso) => `${f.split('-').reverse().join('/')}${iso ? ` <span class="muted">${horaDe(iso)}</span>` : ''}`;
+// si se cargó otro día (p. ej. una venta de ayer pasada del cuaderno), se ve cuándo se cargó de verdad
+const conHora = (f, iso) => `${f.split('-').reverse().join('/')}${!iso ? ''
+  : new Date(iso).toLocaleDateString('en-CA') === f ? ` <span class="muted">${horaDe(iso)}</span>`
+  : ` <span class="muted">· cargado el ${new Date(iso).toLocaleDateString('es-AR', { day: '2-digit', month: '2-digit' })} ${horaDe(iso)}</span>`}`;
 // para buscar sin importar tildes ni mayúsculas: "mani" encuentra "Maní"
 const norm = s => String(s ?? '').normalize('NFD').replace(/\p{Diacritic}/gu, '').toLowerCase();
 const coincide = (p, f) => !f || norm(p.nombre).includes(f) || norm(p.categoria).includes(f);
@@ -948,8 +952,10 @@ async function verMovimientos() {
   // (el orden se arma así y el sort es estable, así que lo que empata queda como está)
   // lo borrado no desaparece del todo: queda qué era, quién lo borró y cuándo
   const cuando = iso => new Date(iso).toLocaleString('es-AR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false });
-  const filaBorrado = b => `<tr class="borrado"><td>${b.fecha.split('-').reverse().join('/')}</td>
-      <td>Borrado${por(b.usuario)} <span class="muted">· ${cuando(b.creado)}</span></td><td colspan="4"><s>${esc(b.detalle)}</s></td><td></td></tr>`;
+  // también correcciones de caja, cambios de productos y de usuarios (lo que se pisó no se pierde)
+  const filaBorrado = b => { const borrado = (b.accion ?? 'Borrado') === 'Borrado';
+    return `<tr class="${borrado ? 'borrado' : 'caja'}"><td>${b.fecha.split('-').reverse().join('/')}</td>
+      <td>${esc(b.accion ?? 'Borrado')}${por(b.usuario)} <span class="muted">· ${cuando(b.creado)}</span></td><td colspan="4">${borrado ? `<s>${esc(b.detalle)}</s>` : esc(b.detalle)}</td><td></td></tr>`; };
   const filas = [
     ...caja.borrados.map(b => ({ f: b.fecha, k: b.creado, html: filaBorrado(b) })),
     ...caja.cierres.map(c => ({ f: c.fecha, k: c.creado ?? '￿', html: filaCierre(c) })),
@@ -1240,6 +1246,16 @@ $('#formUsuarios').onsubmit = async e => {
   const f = e.target, nombre = f.nombre.value.trim();
   const deBaja = usuarios.find(u => !u.activo && norm(u.nombre) === norm(nombre)); // volver a cargarlo lo reactiva
   if (await cambioUsuarios({ nombre, pin: f.pin.value }, `${deBaja ? `${deBaja.nombre} reactivado` : `${nombre} agregado`}. Ya puede entrar con su PIN.`)) { f.nombre.value = ''; f.pin.value = ''; }
+};
+$('#cerrarSesiones').onclick = async () => {
+  const f = $('#formUsuarios');
+  if (!f.admin.reportValidity()) return;
+  if (!confirm('Todos los dispositivos (menos este) van a tener que volver a poner la contraseña del negocio. ¿Seguir?')) return;
+  try {
+    await api('POST', '/api/sesiones/cerrar', { admin: f.admin.value });
+    flash($('#msgUsuarios'), 'Listo: las demás sesiones quedaron cerradas. Si la contraseña se filtró, cambiala también en Vercel.');
+    $('#msgUsuarios').classList.add('ok');
+  } catch (err) { flash($('#msgUsuarios'), err.message, true); }
 };
 $('#listaUsuarios').onclick = async e => {
   const { pin, baja } = e.target.dataset, u = usuarios.find(x => x.id == (pin || baja));

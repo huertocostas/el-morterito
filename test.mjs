@@ -51,7 +51,8 @@ try {
   // falla pasajera: con la base trabada, preparar la base falla y se avisa con el detalle...
   const fallo = await api('GET', '/api/productos');
   assert.equal(fallo.status, 500);
-  assert.match(fallo.data.error, /probá de nuevo.*Detalle/);
+  assert.match(fallo.data.error, /probá de nuevo.*Código/);
+  assert.doesNotMatch(fallo.data.error, /SQLITE|database|locked/i, 'el detalle técnico no se muestra');
   // ...y apenas se libera, el siguiente pedido funciona (antes quedaba en "Error interno" hasta reiniciar)
   await trabaTx.rollback(); trabaTx.close(); traba.close();
   assert.equal((await api('GET', '/api/productos')).status, 200);
@@ -329,6 +330,34 @@ try {
   assert.equal((await api('DELETE', '/api/movimientos?id=' + otro.id)).status, 403);
   jar.set('usuario', jarU); cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
 
+  // lo que se pisa queda en el historial: corrección de apertura y de cierre, con el valor anterior y quién lo había hecho
+  await api('POST', '/api/apertura', { fecha: '2026-11-08', monto: 25, pin: '4321' });
+  await api('POST', '/api/cierre', { fecha: '2026-11-08', contado: 40, pin: '4321' });
+  const corr = (await api('GET', '/api/caja?desde=2026-11-08&hasta=2026-11-08')).data.borrados.filter(b => b.accion === 'Corrección');
+  assert.equal(corr.length, 2, JSON.stringify(corr));
+  assert.ok(corr.some(b => b.detalle.startsWith(`Apertura de caja: ${plata(10)} → ${plata(25)} (la había cargado Ana)`)), JSON.stringify(corr));
+  assert.ok(corr.some(b => b.detalle.startsWith(`Cierre de caja: contado ${plata(10)} → ${plata(40)}`)) && corr.every(b => b.usuario === 'Ana'));
+  // cambios de producto (precio, costo, unidad) quedan anotados; sin PIN no se pueden hacer
+  const yerbaP = (await api('GET', '/api/productos')).data.find(p => p.id === yerba);
+  assert.equal((await api('POST', '/api/productos', { ...yerbaP, precio_minorista: yerbaP.precio_minorista + 1 })).status, 200);
+  const hoyAr = new Date(Date.now() - 3 * 3600e3).toISOString().slice(0, 10);
+  const registroHoy = async () => (await api('GET', `/api/caja?desde=${hoyAr}&hasta=${hoyAr}`)).data.borrados;
+  assert.ok((await registroHoy()).some(b => b.accion === 'Cambio' && b.usuario === 'Ana'
+    && b.detalle === `Producto "${yerbaP.nombre}": minorista ${plata(yerbaP.precio_minorista)} → ${plata(yerbaP.precio_minorista + 1)}`));
+  jar.delete('usuario'); cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+  assert.equal((await api('POST', '/api/productos', { ...yerbaP })).status, 403, 'cambiar un producto pide PIN');
+  jar.set('usuario', jarU); cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+  // cambiarle el PIN a alguien queda anotado y le cierra el turno que tenía abierto
+  const turnoViejo = jar.get('usuario');
+  await api('POST', '/api/usuarios', { admin: 'clave-test', id: ana, pin: '8765' });
+  assert.ok((await registroHoy()).some(b => b.accion === 'Usuarios' && b.detalle === '"Ana": PIN cambiado'));
+  jar.set('usuario', turnoViejo); cookie = [...jar].map(([k, v]) => `${k}=${v}`).join('; ');
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-08', categoria: 'Otros', monto: 1, medio_pago: 'efectivo' })).status, 403, 'turno viejo ya no vale');
+  assert.equal((await api('POST', '/api/usuario/entrar', { pin: '8765' })).status, 200);
+  assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-08', categoria: 'Otros', monto: 1, medio_pago: 'efectivo' })).status, 200);
+  await api('POST', '/api/usuarios', { admin: 'clave-test', id: ana, pin: '4321' }); // las pruebas de abajo usan este
+  await api('POST', '/api/usuario/entrar', { pin: '4321' });
+
   // textos con largo máximo
   assert.equal((await api('POST', '/api/productos', { nombre: 'x'.repeat(81), precio_minorista: 1 })).status, 400);
   assert.equal((await api('POST', '/api/gastos', { fecha: '2026-11-08', categoria: 'Otros', monto: 1, medio_pago: 'efectivo', concepto: 'y'.repeat(151) })).status, 400);
@@ -382,6 +411,20 @@ try {
   const otroDispositivo = `sesion=${tNuevo}.${firmar(tNuevo)}`;
   const enOtro = await fetch(`http://127.0.0.1:${PORT}/api/usuario/entrar`, { method: 'POST', headers: { cookie: otroDispositivo }, body: JSON.stringify({ pin: '4321' }) });
   assert.equal(enOtro.status, 200, 'el otro dispositivo sigue pudiendo entrar');
+  await api('POST', '/api/logout');
+
+  // celular perdido: cerrar la sesión en todos los dispositivos deja afuera a los demás y no a este
+  await api('POST', '/api/login', { password: 'clave-test' });
+  assert.equal(await conCookie(otroDispositivo), 200);
+  assert.equal((await api('POST', '/api/sesiones/cerrar', { admin: 'mal' })).status, 400);
+  assert.equal((await api('POST', '/api/sesiones/cerrar', { admin: 'clave-test' })).status, 200);
+  assert.equal(await conCookie(otroDispositivo), 401, 'el otro dispositivo quedó afuera');
+  assert.equal((await api('GET', '/api/productos')).status, 200, 'este dispositivo sigue adentro');
+  assert.ok((await registroHoy()).some(b => b.accion === 'Seguridad'));
+
+  // muchos PIN equivocados al mismo tiempo: el límite no se saltea (antes contaba y después anotaba)
+  const simultaneos = await Promise.all(Array.from({ length: 20 }, (_, i) => api('POST', '/api/usuario/entrar', { pin: String(5000 + i) })));
+  assert.ok(simultaneos.filter(r => r.status === 400).length <= 8 && simultaneos.some(r => r.status === 429), simultaneos.map(r => r.status).join(','));
   await api('POST', '/api/logout');
 
   // límite de intentos: tras 8 contraseñas incorrectas se bloquea (aunque después pongan la correcta)

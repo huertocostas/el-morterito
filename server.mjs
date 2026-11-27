@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS cierres (
   esperado REAL NOT NULL,
   usuario_id INTEGER
 );
+-- ajustes sueltos (p. ej. desde cuándo valen las sesiones, para cerrarlas en todos los dispositivos)
+CREATE TABLE IF NOT EXISTS ajustes (clave TEXT PRIMARY KEY, valor TEXT NOT NULL);
 `);
   // columnas agregadas después de la primera versión (la base de Turso ya existe)
   for (const sql of ['ALTER TABLE productos ADD COLUMN costo REAL NOT NULL DEFAULT 0',
@@ -87,7 +89,11 @@ CREATE TABLE IF NOT EXISTS cierres (
     'ALTER TABLE aperturas ADD COLUMN usuario_id INTEGER',
     // momento en que se registró (ISO, UTC); lo de antes queda sin hora
     'ALTER TABLE movimientos ADD COLUMN creado TEXT', 'ALTER TABLE gastos ADD COLUMN creado TEXT',
-    'ALTER TABLE aperturas ADD COLUMN creado TEXT', 'ALTER TABLE cierres ADD COLUMN creado TEXT']) {
+    'ALTER TABLE aperturas ADD COLUMN creado TEXT', 'ALTER TABLE cierres ADD COLUMN creado TEXT',
+    // el registro guarda también correcciones y cambios, no solo borrados
+    "ALTER TABLE borrados ADD COLUMN accion TEXT NOT NULL DEFAULT 'Borrado'",
+    // al cambiar el PIN o dar de baja, los turnos abiertos antes de este momento dejan de valer
+    'ALTER TABLE usuarios ADD COLUMN turno_desde INTEGER NOT NULL DEFAULT 0']) {
     try { await db.execute(sql); } catch (e) { if (!/duplicate column/i.test(e.message)) throw e; }
   }
 }
@@ -142,6 +148,14 @@ const autenticado = req => {
   const m = /(?:^|;\s*)sesion=([a-z0-9]{1,12})\.([a-f0-9]{64})/.exec(req.headers.cookie || '');
   return !!m && igual(m[2], firmaSesion(m[1])) && Date.now() - parseInt(m[1], 36) < DURA_SESION * 1000;
 };
+// "cerrar la sesión en todos los dispositivos" (p. ej. si se pierde el celular): valen solo las sesiones posteriores
+// shortcut: cada instancia recuerda el valor 30 s; otra instancia de Vercel puede tardar eso en enterarse
+let desdeCache = { valor: 0, hasta: 0 };
+async function sesionesDesde() {
+  if (Date.now() > desdeCache.hasta)
+    desdeCache = { valor: Number((await one("SELECT valor FROM ajustes WHERE clave = 'sesiones_desde'"))?.valor ?? 0), hasta: Date.now() + 30000 };
+  return desdeCache.valor;
+}
 const esperar = ms => new Promise(r => setTimeout(r, ms));
 const ahora = () => new Date().toISOString(); // la hora la pone el servidor, no el reloj de cada dispositivo
 const esHttps = req => req.headers['x-forwarded-proto'] === 'https';
@@ -154,30 +168,40 @@ const TURNO = 14 * 60 * 60; // el PIN se vuelve a pedir al día siguiente
 // "id.momento.firma": el turno vence a las 14 h también en el servidor (no solo en el navegador)
 const firmaUsuario = (id, t) => createHmac('sha256', SECRETO).update(`usuario:${id}:${t}`).digest('hex');
 const nuevoTurno = id => { const t = Date.now().toString(36); return `${id}.${t}.${firmaUsuario(id, t)}`; };
-const usuarioCookie = req => {
+// { id, desde }: quién y desde cuándo (ms) tiene el turno abierto
+const turnoDe = req => {
   const m = /(?:^|;\s*)usuario=(\d{1,9})\.([a-z0-9]{1,12})\.([a-f0-9]{64})/.exec(req.headers.cookie || '');
-  return m && igual(m[3], firmaUsuario(m[1], m[2])) && Date.now() - parseInt(m[2], 36) < TURNO * 1000 ? Number(m[1]) : null;
+  const desde = m && parseInt(m[2], 36);
+  return m && igual(m[3], firmaUsuario(m[1], m[2])) && Date.now() - desde < TURNO * 1000 ? { id: Number(m[1]), desde } : null;
 };
+const usuarioCookie = req => turnoDe(req)?.id ?? null;
 
 // ---------- límite de intentos (contraseña del negocio y PINs) ----------
 // Se cuenta en la base (en Vercel no hay memoria compartida entre pedidos): más de 8 fallos
 // desde la misma IP en 15 minutos bloquean ese tipo de intento hasta que pase la ventana.
 const VENTANA_INTENTOS = 15 * 60 * 1000, MAX_FALLOS = 8;
-const ipDe = req => String(req.headers['x-forwarded-for'] || req.socket?.remoteAddress || 'desconocida').split(',')[0].trim();
+// En Vercel la IP la pone la plataforma (x-vercel-forwarded-for); en local se usa la conexión, porque
+// x-forwarded-for lo puede inventar cualquiera y así saltear el límite cambiando de "IP" en cada intento
+const ipDe = req => String((process.env.VERCEL && (req.headers['x-vercel-forwarded-for'] || req.headers['x-real-ip']))
+  || req.socket?.remoteAddress || 'desconocida').split(',')[0].trim();
 // PIN y administración solo se usan en un dispositivo que ya entró con la contraseña del negocio: se cuentan
 // por dispositivo (su sesión), así un dueño que se equivoca no bloquea al otro en el mismo wifi del local
 const dispositivoDe = req => /(?:^|;\s*)sesion=([a-z0-9]{1,12})\./.exec(req.headers.cookie || '')?.[1];
+// El intento se anota ANTES de revisar la contraseña y se cuenta junto con los anteriores en la misma escritura:
+// si se contaba primero y se anotaba después, muchos pedidos simultáneos pasaban todos antes del bloqueo.
+// Si sale bien, se borra (intentoOk), así que solo quedan contados los fallos.
 async function frenarSiAbusa(req, tipo) {
-  const clave = `${tipo}:${(tipo !== 'login' && dispositivoDe(req)) || ipDe(req)}`;
-  const { n } = await one('SELECT COUNT(*) AS n FROM intentos WHERE clave = ? AND ts > ?', [clave, Date.now() - VENTANA_INTENTOS]);
-  if (n >= MAX_FALLOS) throw new Demasiados('Demasiados intentos fallidos. Esperá 15 minutos y probá de nuevo.');
-  return clave;
-}
-async function anotarFallo(clave) {
-  if (clave) await db.batch([
-    { sql: 'INSERT INTO intentos (clave, ts) VALUES (?, ?)', args: [clave, Date.now()] },
-    { sql: 'DELETE FROM intentos WHERE ts < ?', args: [Date.now() - 24 * 60 * 60 * 1000] }, // limpieza
+  const clave = `${tipo}:${(tipo !== 'login' && dispositivoDe(req)) || ipDe(req)}`, ts = Date.now();
+  const [, cuenta] = await db.batch([
+    { sql: 'INSERT INTO intentos (clave, ts) VALUES (?, ?)', args: [clave, ts] },
+    { sql: 'SELECT COUNT(*) AS n FROM intentos WHERE clave = ? AND ts > ?', args: [clave, ts - VENTANA_INTENTOS] },
   ], 'write');
+  if (cuenta.rows[0].n > MAX_FALLOS) throw new Demasiados('Demasiados intentos fallidos. Esperá 15 minutos y probá de nuevo.');
+  return { clave, ts };
+}
+const intentoOk = i => i && db.execute({ sql: 'DELETE FROM intentos WHERE rowid = (SELECT rowid FROM intentos WHERE clave = ? AND ts = ? LIMIT 1)', args: [i.clave, i.ts] });
+async function anotarFallo(intento) {
+  if (intento) await db.execute({ sql: 'DELETE FROM intentos WHERE ts < ?', args: [Date.now() - 24 * 60 * 60 * 1000] }); // limpieza
   await esperar(800); // además, cada fallo tarda
 }
 const hashPin = (pin, sal = randomBytes(16).toString('hex')) => `${sal}:${scryptSync(String(pin), sal, 32).toString('hex')}`;
@@ -189,8 +213,9 @@ const pinCoincide = (pin, guardado) => {
 const esAdmin = b => !PASSWORD || timingSafeEqual(hash(b.admin ?? ''), hash(PASSWORD));
 // id de quien atiende; si hay usuarios cargados es obligatorio para registrar algo
 async function quien(req) {
-  const id = usuarioCookie(req);
-  const u = id && await one('SELECT id FROM usuarios WHERE id = ? AND activo = 1', [id]);
+  const t = turnoDe(req);
+  // un turno abierto antes de que le cambiaran el PIN (o lo dieran de baja) ya no vale
+  const u = t && await one('SELECT id FROM usuarios WHERE id = ? AND activo = 1 AND turno_desde <= ?', [t.id, t.desde]);
   if (u) return u.id;
   if (await one('SELECT 1 AS hay FROM usuarios WHERE activo = 1 LIMIT 1')) throw new SinUsuario('Ingresá tu PIN para registrar quién atiende');
   return null;
@@ -204,16 +229,20 @@ async function confirmarConPin(b, req) {
   const clave = await frenarSiAbusa(req, 'pin');
   const u = /^\d{4,8}$/.test(pin) && activos.find(u => pinCoincide(pin, u.pin));
   if (!u) { await anotarFallo(clave); throw new BadRequest('PIN incorrecto'); }
+  await intentoOk(clave);
   return u.id;
 }
+// para lo que no está obligado a tener usuario (administrar usuarios): quién estaba atendiendo, si había alguien
+const quienSiHay = req => quien(req).catch(e => { if (e instanceof SinUsuario) return null; throw e; });
 
 // borrar deja rastro: qué era, de qué día, quién lo borró y cuándo
 const plata = n => new Intl.NumberFormat('es-AR', { style: 'currency', currency: 'ARS' }).format(n);
 const PLURAL = { unidad: 'unidades', paquete: 'paquetes', litro: 'litros' };
 const cuanto = (n, u) => u === 'kg' && Math.abs(n) < 1 ? `${Math.round(n * 1000)} g` // fracciones: "150 g" mejor que "0,15 kg"
   : `${new Intl.NumberFormat('es-AR', { maximumFractionDigits: 3 }).format(n)} ${Math.abs(n) === 1 ? u : PLURAL[u] ?? u}`;
-const registroBorrado = (fecha, uid, detalle) =>
-  ({ sql: 'INSERT INTO borrados (fecha, creado, usuario_id, detalle) VALUES (?, ?, ?, ?)', args: [fecha, ahora(), uid, detalle] });
+// accion: 'Borrado', 'Corrección' (se pisó un valor), 'Cambio' (producto), 'Usuarios', 'Seguridad'
+const registroBorrado = (fecha, uid, detalle, accion = 'Borrado') =>
+  ({ sql: 'INSERT INTO borrados (fecha, creado, usuario_id, detalle, accion) VALUES (?, ?, ?, ?, ?)', args: [fecha, ahora(), uid, detalle, accion] });
 // shortcut: Argentina es UTC-3 todo el año (sin horario de verano); si el negocio cambia de país, usar Intl con su zona
 const hoyArgentina = () => new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString().slice(0, 10);
 
@@ -238,6 +267,7 @@ const routes = {
       await anotarFallo(clave).catch(() => esperar(800));
       throw new BadRequest('Contraseña incorrecta');
     }
+    await intentoOk(clave)?.catch(() => {});
     res.setHeader('Set-Cookie', cookie(req, 'sesion', nuevaSesion(), DURA_SESION));
     return { ok: true };
   },
@@ -253,6 +283,9 @@ const routes = {
   'POST /api/usuarios': async (b, _, req) => {
     const clave = await frenarSiAbusa(req, 'admin');
     if (!esAdmin(b)) { await anotarFallo(clave); throw new BadRequest('La contraseña del negocio no es correcta'); }
+    await intentoOk(clave);
+    // todo cambio de usuarios queda en el historial con quién estaba atendiendo: cambiarle el PIN a otro no es invisible
+    const uid = await quienSiHay(req), registrar = detalle => registroBorrado(hoyArgentina(), uid, detalle, 'Usuarios');
     const activos = await all('SELECT id, nombre, pin FROM usuarios WHERE activo = 1');
     const pin = String(b.pin ?? '');
     if (pin) {
@@ -263,16 +296,22 @@ const routes = {
     if (b.id) {
       const id = Number(b.id);
       check(Number.isInteger(id) && id > 0, 'Usuario inexistente');
-      const actual = await one('SELECT activo FROM usuarios WHERE id = ?', [id]);
+      const actual = await one('SELECT nombre, activo FROM usuarios WHERE id = ?', [id]);
       check(actual, 'Usuario inexistente');
       // al reactivar, su PIN viejo puede estar usándolo otra persona (y no se puede saber: está cifrado)
       check(!(b.activo && !actual.activo && !pin), 'Para volver a activarlo, poné un PIN nuevo');
-      const sets = [], args = [];
-      if (pin) { sets.push('pin = ?'); args.push(hashPin(pin)); }
-      if (b.activo !== undefined) { sets.push('activo = ?'); args.push(b.activo ? 1 : 0); }
+      const sets = [], args = [], hechos = [];
+      if (pin) { sets.push('pin = ?'); args.push(hashPin(pin)); hechos.push('PIN cambiado'); }
+      if (b.activo !== undefined && !!b.activo !== !!actual.activo) {
+        sets.push('activo = ?'); args.push(b.activo ? 1 : 0); hechos.push(b.activo ? 'reactivado' : 'dado de baja');
+      }
       check(sets.length, 'No hay nada para cambiar');
-      const r = await db.execute({ sql: `UPDATE usuarios SET ${sets.join(', ')} WHERE id = ?`, args: [...args, id] });
-      check(r.rowsAffected === 1, 'Usuario inexistente');
+      // con PIN nuevo o dado de baja, el turno que tenía abierto (en cualquier dispositivo) se cierra
+      sets.push('turno_desde = ?'); args.push(Date.now());
+      await db.batch([
+        { sql: `UPDATE usuarios SET ${sets.join(', ')} WHERE id = ?`, args: [...args, id] },
+        registrar(`"${actual.nombre}": ${hechos.join(' y ')}`),
+      ], 'write');
       return { id };
     }
     const nombre = texto(b.nombre, 'Nombre', 40);
@@ -283,10 +322,12 @@ const routes = {
     const mismo = (await all('SELECT id, nombre, activo FROM usuarios')).find(u => u.nombre.toLocaleLowerCase('es') === comparable);
     check(!mismo?.activo, 'Ya hay un usuario con ese nombre');
     if (mismo) {
-      await db.execute({ sql: 'UPDATE usuarios SET pin = ?, activo = 1 WHERE id = ?', args: [hashPin(pin), mismo.id] });
+      await db.batch([{ sql: 'UPDATE usuarios SET pin = ?, activo = 1, turno_desde = ? WHERE id = ?', args: [hashPin(pin), Date.now(), mismo.id] },
+        registrar(`"${mismo.nombre}": reactivado con PIN nuevo`)], 'write');
       return { id: mismo.id, reactivado: true };
     }
-    const r = await db.execute({ sql: 'INSERT INTO usuarios (nombre, pin) VALUES (?, ?)', args: [nombre, hashPin(pin)] });
+    const [r] = await db.batch([{ sql: 'INSERT INTO usuarios (nombre, pin) VALUES (?, ?)', args: [nombre, hashPin(pin)] },
+      registrar(`"${nombre}": usuario nuevo`)], 'write');
     return { id: Number(r.lastInsertRowid) };
   },
 
@@ -295,6 +336,7 @@ const routes = {
     const clave = await frenarSiAbusa(req, 'pin');
     const u = /^\d{4,8}$/.test(pin) && (await all('SELECT id, nombre, pin FROM usuarios WHERE activo = 1')).find(u => pinCoincide(pin, u.pin));
     if (!u) { await anotarFallo(clave); throw new BadRequest('PIN incorrecto'); }
+    await intentoOk(clave);
     res.setHeader('Set-Cookie', cookie(req, 'usuario', nuevoTurno(u.id), TURNO));
     return { id: u.id, nombre: u.nombre };
   },
@@ -304,10 +346,26 @@ const routes = {
     return { ok: true };
   },
 
+  // celular perdido o robado: todas las sesiones abiertas dejan de valer; este dispositivo recibe una nueva
+  'POST /api/sesiones/cerrar': async (b, _, req, res) => {
+    const clave = await frenarSiAbusa(req, 'admin');
+    if (!esAdmin(b)) { await anotarFallo(clave); throw new BadRequest('La contraseña del negocio no es correcta'); }
+    await intentoOk(clave);
+    const uid = await quienSiHay(req), desde = Date.now();
+    await db.batch([
+      { sql: "INSERT INTO ajustes (clave, valor) VALUES ('sesiones_desde', ?) ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor", args: [String(desde)] },
+      registroBorrado(hoyArgentina(), uid, 'Se cerró la sesión en todos los dispositivos', 'Seguridad'),
+    ], 'write');
+    desdeCache = { valor: desde, hasta: Date.now() + 30000 };
+    await esperar(2); // que la sesión nueva sea posterior al corte
+    res.setHeader('Set-Cookie', cookie(req, 'sesion', nuevaSesion(), DURA_SESION));
+    return { ok: true };
+  },
+
   'GET /api/productos': () =>
     all('SELECT * FROM stock ORDER BY activo DESC, nombre'),
 
-  'POST /api/productos': async (b) => {
+  'POST /api/productos': async (b, _, req) => {
     const nombre = texto(b.nombre, 'Nombre', 80);
     check(nombre, 'Falta el nombre');
     const p = {
@@ -325,10 +383,21 @@ const routes = {
     check(!(await all('SELECT id, nombre FROM productos'))
       .some(x => x.id !== Number(b.id) && x.nombre.toLocaleLowerCase('es') === clave), 'Ya existe un producto con ese nombre');
     const cols = Object.keys(p);
+    const uid = await quien(req);
     if (b.id) {
-      const r = await db.execute({ sql: `UPDATE productos SET ${cols.map(c => `${c}=:${c}`).join(',')} WHERE id=:id`, args: { ...p, id: Number(b.id) } });
-      check(r.rowsAffected === 1, 'Producto no encontrado');
-      return { id: Number(b.id) };
+      const id = Number(b.id);
+      check(Number.isInteger(id) && id > 0, 'Producto no encontrado');
+      const antes = await one('SELECT * FROM productos WHERE id = ?', [id]);
+      check(antes, 'Producto no encontrado');
+      // cambios de precio, costo, unidad o nombre quedan en el historial con quién los hizo
+      const NOMBRES = { nombre: 'nombre', unidad: 'unidad', precio_minorista: 'minorista', precio_mayorista: 'mayorista', costo: 'costo', activo: 'activo' };
+      const ver = (c, v) => c === 'activo' ? (v ? 'sí' : 'no') : c.startsWith('precio') || c === 'costo' ? plata(v) : v;
+      const cambios = Object.keys(NOMBRES).filter(c => antes[c] !== p[c]).map(c => `${NOMBRES[c]} ${ver(c, antes[c])} → ${ver(c, p[c])}`);
+      await db.batch([
+        ...(cambios.length ? [registroBorrado(hoyArgentina(), uid, `Producto "${antes.nombre}": ${cambios.join(', ')}`, 'Cambio')] : []),
+        { sql: `UPDATE productos SET ${cols.map(c => `${c}=:${c}`).join(',')} WHERE id=:id`, args: { ...p, id } },
+      ], 'write');
+      return { id };
     }
     const r = await db.execute({ sql: `INSERT INTO productos (${cols}) VALUES (${cols.map(c => ':' + c)})`, args: p });
     return { id: Number(r.lastInsertRowid) };
@@ -421,7 +490,7 @@ const routes = {
         LEFT JOIN usuarios u ON u.id = a.usuario_id WHERE a.fecha BETWEEN ? AND ? ORDER BY a.fecha DESC`, r),
       cierres: await all(`SELECT c.fecha, c.contado, c.esperado, c.creado, u.nombre AS usuario FROM cierres c
         LEFT JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha BETWEEN ? AND ? ORDER BY c.fecha DESC`, r),
-      borrados: await all(`SELECT b.fecha, b.creado, b.detalle, u.nombre AS usuario FROM borrados b
+      borrados: await all(`SELECT b.fecha, b.creado, b.detalle, b.accion, u.nombre AS usuario FROM borrados b
         LEFT JOIN usuarios u ON u.id = b.usuario_id WHERE b.fecha BETWEEN ? AND ? ORDER BY b.creado DESC`, r),
     };
   },
@@ -484,9 +553,15 @@ const routes = {
     check(b.monto !== '' && b.monto != null, 'Poné con cuánto efectivo empezás (puede ser 0)');
     const monto = num(b.monto, 'Monto');
     const uid = await confirmarConPin(b, req);
-    await db.execute({ sql: `INSERT INTO aperturas (fecha, monto, usuario_id, creado) VALUES (?, ?, ?, ?)
+    // corregir pisa el valor: el anterior queda en el historial (cuánto era y quién lo había cargado)
+    const antes = await one(`SELECT a.monto, u.nombre AS usuario FROM aperturas a LEFT JOIN usuarios u ON u.id = a.usuario_id WHERE a.fecha = ?`, [b.fecha]);
+    await db.batch([
+      ...(antes && antes.monto !== monto ? [registroBorrado(b.fecha, uid,
+        `Apertura de caja: ${plata(antes.monto)} → ${plata(monto)}${antes.usuario ? ` (la había cargado ${antes.usuario})` : ''}`, 'Corrección')] : []),
+      { sql: `INSERT INTO aperturas (fecha, monto, usuario_id, creado) VALUES (?, ?, ?, ?)
         ON CONFLICT(fecha) DO UPDATE SET monto = excluded.monto, usuario_id = excluded.usuario_id, creado = excluded.creado`,
-      args: [b.fecha, monto, uid, ahora()] });
+      args: [b.fecha, monto, uid, ahora()] },
+    ], 'write');
     return { ok: true };
   },
 
@@ -497,11 +572,15 @@ const routes = {
     const contado = num(b.contado, 'Efectivo contado');
     const uid = await confirmarConPin(b, req);
     const esperado = await efectivoEsperado(b.fecha);
-    await db.execute({
-      sql: `INSERT INTO cierres (fecha, contado, esperado, usuario_id, creado) VALUES (?, ?, ?, ?, ?)
+    const antes = await one(`SELECT c.contado, c.esperado, u.nombre AS usuario FROM cierres c LEFT JOIN usuarios u ON u.id = c.usuario_id WHERE c.fecha = ?`, [b.fecha]);
+    await db.batch([
+      // volver a cerrar pisa el cierre anterior: lo que se había contado queda en el historial
+      ...(antes ? [registroBorrado(b.fecha, uid, `Cierre de caja: contado ${plata(antes.contado)} → ${plata(contado)}`
+        + ` (tenía que haber ${plata(antes.esperado)}${antes.usuario ? `; lo había cerrado ${antes.usuario}` : ''})`, 'Corrección')] : []),
+      { sql: `INSERT INTO cierres (fecha, contado, esperado, usuario_id, creado) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(fecha) DO UPDATE SET contado = excluded.contado, esperado = excluded.esperado, usuario_id = excluded.usuario_id, creado = excluded.creado`,
-      args: [b.fecha, contado, esperado, uid, ahora()],
-    });
+      args: [b.fecha, contado, esperado, uid, ahora()] },
+    ], 'write');
     return { contado, esperado, diferencia: Math.round((contado - esperado) * 100) / 100 };
   },
 
@@ -582,15 +661,19 @@ export async function handler(req, res) {
   if (process.env.VERCEL && !PASSWORD) return send(503, { error: 'Falta configurar APP_PASSWORD en Vercel' });
   if (!PUBLICAS.includes(key) && !autenticado(req)) return send(401, { error: 'Iniciá sesión' });
   try {
-    if (!SIN_BASE.includes(key)) await preparar();
+    if (!SIN_BASE.includes(key)) {
+      await preparar();
+      if (PASSWORD && !PUBLICAS.includes(key) && parseInt(dispositivoDe(req), 36) < await sesionesDesde()) return send(401, { error: 'Iniciá sesión' });
+    }
     const body = req.method === 'POST' ? await leerBody(req) : {};
     send(200, await route(body, url.searchParams, req, res));
   } catch (e) {
     if (e instanceof BadRequest) return send(e instanceof Conflict ? 409 : e instanceof SinUsuario ? 403 : e instanceof Demasiados ? 429 : 400, { error: e.message });
     if (String(e.message).includes('UNIQUE')) return send(400, { error: 'Ya existe uno con ese nombre' });
-    console.error(e);
-    // solo lo ven usuarios con sesión (los dueños): el detalle sirve para diagnosticar desde una captura
-    send(500, { error: `No se pudo completar, probá de nuevo en unos segundos. (Detalle: ${e.message})` });
+    // el detalle técnico queda en los logs (Vercel) con un código; la pantalla muestra solo el código para buscarlo
+    const codigo = Date.now().toString(36);
+    console.error(`[error ${codigo}]`, e);
+    send(500, { error: `No se pudo completar, probá de nuevo en unos segundos. (Código ${codigo})` });
   }
 }
 
